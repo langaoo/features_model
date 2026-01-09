@@ -50,7 +50,12 @@ def main() -> None:
 
     p.add_argument("--model", type=str, required=True, choices=["croco", "vggt", "dinov3", "da3"])
 
-    p.add_argument("--rgb_root", type=str, default="/home/gl/features_model/rgb_dataset/RGB")
+    p.add_argument(
+        "--rgb_root", 
+        type=str, 
+        default="/home/gl/features_model/rgb_dataset/RGB",
+        help="RGB 图片根目录。可用路径：rgb_dataset/RGB（处理后）或 rgb_dataset/RGB_ORI（原始）"
+    )
     p.add_argument(
         "--out_root",
         type=str,

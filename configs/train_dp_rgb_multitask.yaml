@@ -1,0 +1,51 @@
+# configs/train_dp_rgb_multitask.yaml
+# 多任务 DP（共享 RGB2PC encoder + 任务专属 head）
+# 任务列表从 raw_data 自动扫描（B 方案）
+
+rgb_zarr_roots:
+  - /home/gl/features_model/rgb_dataset/features_croco_encoder_dict_unified_zarr
+
+traj_root: /home/gl/features_model/raw_data
+
+# 共享 encoder（rgb2pc 蒸馏 ckpt）
+rgb_ckpt_path: /home/gl/features_model/outputs/train_rgb2pc_runs/run_best_bs32/ckpt_step_0010000.pt
+freeze_encoder: true
+
+# 训练的 action_dim 组：0 表示自动选择“样本里数量最多/或最大 action_dim”的组
+# 如果你想分别训 action_dim=7 和 action_dim=4，改这个值后分别跑两次。
+target_action_dim: 0
+
+# DP 时序配置
+horizon: 8
+n_obs_steps: 2
+n_action_steps: 4
+obs_as_global_cond: true
+
+# 机械臂配置（会影响 action_dim 的计算）
+use_left_arm: true
+use_right_arm: false
+fuse_arms: false
+
+# 可选：只训练包含某些关键词的 task（按 task 名 substring 匹配）
+# task_include: ["shake_bottle", "stack_bowls"]
+# task_exclude: ["outputs"]
+
+# 正常化统计采样数
+norm_samples: 2000
+
+# 训练超参
+device: cuda
+epochs: 20
+batch_size: 32
+num_workers: 8
+lr: 1.0e-4
+betas: [0.95, 0.999]
+eps: 1.0e-8
+weight_decay: 1.0e-6
+
+amp: true
+log_every: 50
+save_every: 5
+seed: 42
+
+tqdm: true

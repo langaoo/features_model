@@ -19,7 +19,12 @@ except ImportError:
 # Setup paths
 WORKSPACE_DIR = "/home/gl/features_model"
 ULIP_DIR = os.path.join(WORKSPACE_DIR, "ULIP-main/ULIP-main")
-PC_SOURCE_DIR = os.path.join(WORKSPACE_DIR, "pc_dataset/PC_source")
+
+# 支持两个数据源（优先使用 PC_ORI，fallback 到 PC_source）
+PC_SOURCE_DIR_NEW = os.path.join(WORKSPACE_DIR, "pc_dataset/PC_ORI")
+PC_SOURCE_DIR_OLD = os.path.join(WORKSPACE_DIR, "pc_dataset/PC_source")
+PC_SOURCE_DIR = PC_SOURCE_DIR_NEW if os.path.exists(PC_SOURCE_DIR_NEW) else PC_SOURCE_DIR_OLD
+
 OUTPUT_ZARR_DIR = os.path.join(WORKSPACE_DIR, "pc_dataset/ulip_features_zarr")
 
 # Add ULIP to sys.path

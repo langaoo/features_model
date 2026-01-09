@@ -1,31 +1,57 @@
+# DataSets
 rgb_dataset/
 pc_dataset/
+raw_data/
+
+# Models & Weights
 *.pt
 *.pth
+*.ckpt
+*.weights
+weight/
+pretrain_model/
+pretrained_models/
+
+# Logs & Outputs
 outputs/
 logs/
-__pycache__/
+_runs/
+wandb/
 *.log
 *.csv
-*.zip
-*.tar
-*.tar.gz
+
+# Python
+__pycache__/
+*.py[cod]
 *.egg-info/
-.vscode/
-.idea/
-.DS_Store
-env/
-venv/
-*.env
-.env.local
-.env.*.local
 .ipynb_checkpoints/
-*.pytest_cache/
 .pytest_cache/
-.mypy_cache/
-.pyre/
-.pytype/
 .coverage
 htmlcov/
 .tox/
 .nox/
+env/
+venv/
+.venv/
+*.env
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# External Projects (keep as local dependencies, not committed)
+RoBoTwin
+DP/
+croco/
+dinov3/
+vggt/
+Depth-Anything-3/
+ULIP-main/
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.gitattributes
+*.safetensors

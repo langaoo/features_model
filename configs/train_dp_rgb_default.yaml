@@ -1,0 +1,94 @@
+# configs/train_dp_rgb_default.yaml
+# Diffusion Policy with RGB 蒸馏特征训练配置
+
+# ============================================================
+# 数据配置
+# ============================================================
+
+# RGB 特征 zarr 根目录（使用你训练好的蒸馏特征）
+# 注意：这里只需要一个 root，因为我们会使用训练好的融合模型
+rgb_zarr_roots:
+  - /home/gl/features_model/rgb_dataset/features_croco_encoder_dict_unified_zarr
+
+# 原始轨迹数据根目录
+traj_root: /home/gl/features_model/raw_data
+
+# 任务列表（每个任务对应一个 action_dim）
+# 建议：为每个 action_dim 单独训练一个模型
+tasks:
+  - dump_bin_bigbin-demo_randomized-20_head_camera
+  - beat_block_hammer-demo_randomized-20_head_camera
+  - place_burger_fries-demo_randomized-20_head_camera
+
+# ============================================================
+# Policy 配置
+# ============================================================
+
+# RGB2PC 蒸馏模型 checkpoint 路径
+# 这个模型会被用作 observation encoder
+rgb_ckpt_path: /home/gl/features_model/outputs/train_rgb2pc_runs/run_best_bs32/ckpt_step_0010000.pt
+
+# 是否冻结特征编码器（建议先 freeze，稳定后再 finetune）
+freeze_encoder: true
+
+# Policy 参数
+horizon: 16          # 预测时域长度
+n_obs_steps: 2       # 观测历史长度
+n_action_steps: 8    # 执行动作步数
+
+# Encoder 输出维度
+obs_encoder_dim: 256
+
+# Diffusion 模型参数
+obs_as_global_cond: true  # 观测作为全局条件
+
+# ============================================================
+# 机械臂配置
+# ============================================================
+
+# 使用哪个/哪些机械臂
+use_left_arm: true
+use_right_arm: false
+fuse_arms: false  # 是否融合双臂动作（如果两个都用）
+
+# ============================================================
+# 训练配置
+# ============================================================
+
+device: cuda
+epochs: 100
+batch_size: 32
+num_workers: 4
+lr: 1.0e-4
+betas: [0.95, 0.999]
+eps: 1.0e-8
+weight_decay: 1.0e-6
+
+# 混合精度训练
+amp: true
+
+# 梯度累积（如果显存不够）
+grad_accum_steps: 1
+
+# 数据增强/填充
+pad_before: 0
+pad_after: 0
+
+# 随机种子
+seed: 42
+
+# ============================================================
+# 日志与保存
+# ============================================================
+
+save_dir: /home/gl/features_model/outputs/dp_rgb_runs/run_default
+save_every: 10
+log_every: 50
+
+tqdm: true
+
+# WandB 日志
+wandb: false
+wandb_project: dp_rgb
+wandb_entity: ""
+wandb_run_name: ""
