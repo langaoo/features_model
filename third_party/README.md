@@ -22,6 +22,7 @@ Credits and sources
 - dinov3: https://github.com/facebookresearch/dinov3
 - vggt: https://github.com/facebookresearch/vggt
 - Depth-Anything-3: https://github.com/ByteDance-Seed/Depth-Anything-3
+- DP/diffusion_policy: https://github.com/your-org/diffusion_policy (vendored snapshot)
 
 Licenses
 
