@@ -55,3 +55,4 @@ ULIP-main/
 *.tar.gz
 *.gitattributes
 *.safetensors
+third_party_weights_archive/

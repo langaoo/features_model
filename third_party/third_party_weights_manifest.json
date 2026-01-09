@@ -1,0 +1,38 @@
+[
+  {
+    "repo": "croco",
+    "path": "croco/pretrained_models/CroCo_V2_ViTLarge_BaseDecoder.pth",
+    "size": 1671852587,
+    "sha256": "c327abc87eda561943b27f4c864b0f39d001c2730cc3c8c22fa68913462ae8fc"
+  },
+  {
+    "repo": "dinov3",
+    "path": "dinov3/weight/7B/model.safetensors",
+    "size": 26864210088,
+    "sha256": "f5a4575ae5741a43f7c87faa38316b0210454c9dc42a0ffbe6243477ca1d44a4"
+  },
+  {
+    "repo": "dinov3",
+    "path": "dinov3/weight/B16/model.safetensors",
+    "size": 342662192,
+    "sha256": "9a21ac3df0c63839d62612dda6f454d816c25611cc7a52966ed5a5a94921dc8b"
+  },
+  {
+    "repo": "vggt",
+    "path": "vggt/weight/model.pt",
+    "size": 5026874952,
+    "sha256": "d15bf50a8615c8225ed48b51ea5cac673d82442ec0309036df555a053253afe0"
+  },
+  {
+    "repo": "vggt",
+    "path": "vggt/weight/model.safetensors",
+    "size": 5026367224,
+    "sha256": "f164acf60724910d8fe1578bb499d800850c7bb0948db7555c413f9fbe60467e"
+  },
+  {
+    "repo": "Depth-Anything-3",
+    "path": "Depth-Anything-3/weight/model.safetensors",
+    "size": 1643843860,
+    "sha256": "739905c423cf0d6ccaf9e61a8401d82ba1ac32d7f4d3ee6dca8f92b377633f64"
+  }
+]
