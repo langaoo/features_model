@@ -1,0 +1,3 @@
+MISSING FILE: vggt/weight/model.safetensors
+size=5026367224
+sha256=f164acf60724910d8fe1578bb499d800850c7bb0948db7555c413f9fbe60467e

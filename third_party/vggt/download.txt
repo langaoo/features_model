@@ -1,0 +1,10 @@
+https://hf-mirror.com/facebook/VGGT-1B/resolve/main/config.json
+  out=config.json
+https://hf-mirror.com/facebook/VGGT-1B/resolve/main/model.pt
+  out=model.pt
+https://hf-mirror.com/facebook/VGGT-1B/resolve/main/.gitattributes
+  out=.gitattributes
+https://hf-mirror.com/facebook/VGGT-1B/resolve/main/README.md
+  out=README.md
+https://hf-mirror.com/facebook/VGGT-1B/resolve/main/model.safetensors
+  out=model.safetensors

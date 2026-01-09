@@ -1,0 +1,3 @@
+MISSING FILE: Depth-Anything-3/weight/model.safetensors
+size=1643843860
+sha256=739905c423cf0d6ccaf9e61a8401d82ba1ac32d7f4d3ee6dca8f92b377633f64

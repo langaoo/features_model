@@ -1,0 +1,18 @@
+# Depth-Anything DA3-LARGE-1.1 模型下载列表（仅含仓库实际文件，无梯子）
+# 格式：URL 换行 + 2空格 out=文件名
+
+# 1. 版本控制文件（可选，可删除）
+https://hf-mirror.com/depth-anything/DA3-LARGE-1.1/resolve/main/.gitattributes
+  out=.gitattributes
+
+# 2. 说明文档（可选）
+https://hf-mirror.com/depth-anything/DA3-LARGE-1.1/resolve/main/README.md
+  out=README.md
+
+# 3. 模型配置文件（必下，加载必需）
+https://hf-mirror.com/depth-anything/DA3-LARGE-1.1/resolve/main/config.json
+  out=config.json
+
+# 4. 主权重文件（核心，单文件无分卷）
+https://hf-mirror.com/depth-anything/DA3-LARGE-1.1/resolve/main/model.safetensors
+  out=model.safetensors
