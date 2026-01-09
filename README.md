@@ -158,4 +158,50 @@ A: RoBoTwin 推荐 14 维（双臂+夹爪）。详见 [README_PIPELINE.md](READM
 
 ---
 
+## 权重（Weights）管理
+
+模型权重通常体积很大，会显著增加仓库大小。我们采用 `third_party/` 作为 vendored 源码快照，并**不**默认将大权重推送到远端。下面说明如何在本地恢复权重，以及如何使用 Git LFS（可选）把权重上传到远端。
+
+1. 使用本地权重（推荐，最简单）
+
+- 如果你已经在本地下载了权重并保存在原始子仓库路径（例如 `vggt/weight/model.pt`），可以运行：
+
+```bash
+# 将本地原始权重复制到 third_party 的占位位置（覆盖占位文件）
+bash scripts/fetch_weights.sh
+```
+
+- 脚本会把 `third_party_weights_manifest.json` 中列出的权重复制到 `third_party/` 对应位置（如果原始路径存在）。
+
+2. 使用远程存储（推荐用于公开/团队共享）
+
+- 把大权重上传到一个外部存储（S3/网盘/NAS），并在 `third_party_weights_manifest.json` 中记录下载 URL（或者在 `DATA_PATHS.md` 中写明获取方式）。我们建议不要直接把权重提交到主仓库，除非你使用 Git LFS 并且了解配额影响。
+
+3. 可选：使用 Git LFS 将权重托管到仓库（需慎用）
+
+- 如果你确实需要把权重包含在仓库历史里，可用 Git LFS：
+
+```bash
+# 启用 LFS
+git lfs install
+# 为 manifest 中的每个权重路径添加追踪（脚本自动完成，见下面）
+bash scripts/prepare_lfs.sh
+# 把权重文件添加到索引并提交（确认 .gitattributes 里已有条目）
+git add <weight-files>
+git commit -m "Add weight files via Git LFS"
+git push origin master
+```
+
+- 注意：Git LFS 有存储/带宽配额（GitHub 限制），请确认你能承担这些配额或使用私有的大文件存储。
+
+4. 说明文档与工具
+
+- `third_party/third_party_weights_manifest.json`：列出所有被排除的大权重（path/size/sha256）。
+- `scripts/fetch_weights.sh`：把本地原始权重复制到 `third_party/` 的占位位置。
+- `scripts/prepare_lfs.sh`：帮助把 manifest 中的权重路径加入 Git LFS track（仅生成 .gitattributes，需你检查后提交）。
+
+如果你要我为你启用 Git LFS 并把某些权重上传，请告诉我你要托管的权重清单（或确认使用 manifest 中的全部权重），我会一步步帮你配置并执行（我会先确认 quota/风险再继续）。
+
+---
+
 **开始你的训练之旅吧！** 🚀
