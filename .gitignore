@@ -41,7 +41,6 @@ venv/
 .DS_Store
 
 # External Projects (keep as local dependencies, not committed)
-RoBoTwin
 DP/
 croco/
 dinov3/
@@ -56,3 +55,7 @@ ULIP-main/
 *.gitattributes
 *.safetensors
 third_party_weights_archive/
+
+# Allow vendored third_party snapshots
+!third_party/
+!third_party/**
