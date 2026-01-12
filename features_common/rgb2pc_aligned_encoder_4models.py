@@ -1,6 +1,6 @@
 """features_common/rgb2pc_aligned_encoder_4models.py
 
-严格版：4 个视觉模型特征 -> 对齐 encoder -> 融合 -> proj_student
+严格版：4 个视觉模型特征 -> 对齐 encoder -> 融合 -> context_encoder -> proj_student
 
 目标：复现 rgb2pc 蒸馏训练时的 student 路径（简化到 per-frame 向量层面）。
 
@@ -11,7 +11,7 @@
 
 说明
     - checkpoints: /home/gl/features_model/outputs/train_rgb2pc_runs/.../ckpt_step_*.pt
-    - ckpt 内包含：adapters (4 个), fusion (logits 形状 [4]), proj_student
+    - ckpt 内包含：adapters (4 个), fusion (logits 形状 [4]), context_encoder, pos_encoder, proj_student
     - DP 训练时我们冻结这个 encoder，仅训练 DP head。
 
 注意
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+import math
 
 import torch
 import torch.nn as nn
@@ -48,12 +49,36 @@ class RGB2PCAligned4ModelSpec:
     fusion: str = "weighted"
 
 
+class PositionalEncoding(nn.Module):
+    """Positional encoding for Transformer."""
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Tensor, shape [seq_len, batch_size, embedding_dim]
+        """
+        x = x + self.pe[:x.size(0)]
+        return self.dropout(x)
+
+
 class RGB2PCAlignedEncoder4Models(nn.Module):
     """Load full 4-model student encoder from ckpt."""
 
-    def __init__(self, spec: RGB2PCAligned4ModelSpec, *, moe_hidden: int = 1024):
+    def __init__(self, spec: RGB2PCAligned4ModelSpec, *, moe_hidden: int = 1024, 
+                 use_context: bool = True, context_layers: int = 2, context_heads: int = 8):
         super().__init__()
         self.spec = spec
+        self.use_context = use_context
 
         class _AdapterMLP(nn.Module):
             # match checkpoint structure: <idx>.net.<k>.*
@@ -82,6 +107,22 @@ class RGB2PCAlignedEncoder4Models(nn.Module):
             self.fusion = MoEFusion(dim=int(spec.fuse_dim), num_models=int(spec.n_models), hidden_dim=int(moe_hidden))
         else:
             raise ValueError(f"Unknown fusion: {spec.fusion}")
+
+        # context encoder: Transformer for token-level enhancement
+        if use_context:
+            self.pos_encoder = PositionalEncoding(d_model=int(spec.fuse_dim), dropout=0.1, max_len=5000)
+            context_layer = nn.TransformerEncoderLayer(
+                d_model=int(spec.fuse_dim),
+                nhead=context_heads,
+                dim_feedforward=int(spec.fuse_dim) * 4,
+                dropout=0.1,
+                activation='gelu',
+                batch_first=False
+            )
+            self.context_encoder = nn.TransformerEncoder(context_layer, num_layers=context_layers)
+        else:
+            self.pos_encoder = None
+            self.context_encoder = None
 
         class _ProjMLP(nn.Module):
             # match ckpt: proj_student.net.*
@@ -132,8 +173,12 @@ class RGB2PCAlignedEncoder4Models(nn.Module):
             if w is None:
                 raise KeyError(f"missing {i}.net.0.weight in ckpt adapters")
             in_dims.append(int(w.shape[1]))
+        
+        # check if context_encoder exists in checkpoint
+        use_context = "context_encoder" in ckpt and "pos_encoder" in ckpt
+        
         spec = RGB2PCAligned4ModelSpec(n_models=4, in_dims=tuple(in_dims), fuse_dim=fuse_dim, fusion=fusion)
-        model = cls(spec, moe_hidden=moe_hidden)
+        model = cls(spec, moe_hidden=moe_hidden, use_context=use_context)
 
         # load adapters by slicing per-index prefix
         for i in range(4):
@@ -147,6 +192,18 @@ class RGB2PCAlignedEncoder4Models(nn.Module):
             fusion_sd = _strip_module_prefix(fusion_sd)
             # should match logits shape [4]
             model.fusion.load_state_dict(fusion_sd, strict=True)
+
+        # context_encoder and pos_encoder
+        if use_context:
+            context_sd = ckpt.get("context_encoder")
+            if context_sd is not None:
+                context_sd = _strip_module_prefix(context_sd)
+                model.context_encoder.load_state_dict(context_sd, strict=True)
+            
+            pos_sd = ckpt.get("pos_encoder")
+            if pos_sd is not None:
+                pos_sd = _strip_module_prefix(pos_sd)
+                model.pos_encoder.load_state_dict(pos_sd, strict=True)
 
         proj_sd = ckpt.get("proj_student")
         if proj_sd is not None:
@@ -180,5 +237,17 @@ class RGB2PCAlignedEncoder4Models(nn.Module):
             zs.append(z)
 
         fused, _w = self.fusion(zs)  # [B*T,D]
-        z = self.proj_student(fused)  # [B*T,D]
+        fused = fused.reshape(b, t, -1)  # [B,T,D]
+        
+        # apply context encoder if available
+        if self.use_context and self.context_encoder is not None:
+            # Transformer expects [T, B, D]
+            fused_transposed = fused.transpose(0, 1)  # [T, B, D]
+            fused_transposed = self.pos_encoder(fused_transposed)
+            enhanced = self.context_encoder(fused_transposed)  # [T, B, D]
+            fused = enhanced.transpose(0, 1)  # [B, T, D]
+        
+        # flatten back to [B*T, D] for proj_student
+        fused_flat = fused.reshape(b * t, -1)
+        z = self.proj_student(fused_flat)  # [B*T,D]
         return z.reshape(b, t, -1)

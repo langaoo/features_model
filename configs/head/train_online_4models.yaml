@@ -1,0 +1,65 @@
+# ===========================
+# 在线训练配置 - 实时特征提取
+# ===========================
+# 适用场景: 新采集的原始数据，没有预提取特征
+# 速度: 慢（每个 batch 需要实时提取 4 模型特征）
+# 优点: 不需要预处理，支持新数据
+
+# 数据路径
+data:
+  raw_data_root: raw_data            # 原始数据根目录（包含HDF5文件）
+  camera_name: head_camera           # 相机名称
+  
+  # 任务列表
+  tasks: 
+    - beat_block_hammer
+  
+  # 数据采样
+  horizon: 8          # 预测未来 8 步
+  n_obs_steps: 2      # 观测 2 帧
+  
+  # 双臂配置
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: false
+
+# 对齐编码器
+encoder:
+  checkpoint: outputs/train_rgb2pc_runs/run_best_bs32/ckpt_step_0006000.pt
+  freeze: true  # 冻结对齐编码器
+
+# 训练配置
+train:
+  epochs: 500
+  batch_size: 16      # 在线训练建议小 batch (2-4)
+  lr: 1e-4
+  num_workers: 0     # DataLoader workers（在线特征提取建议0）
+  
+  # 优化器
+  optimizer: adamw
+  weight_decay: 1e-6
+
+# 策略网络
+policy:
+  type: SimpleMLP    # 策略类型: SimpleMLP | OfficialDP
+  hidden_dim: 512
+  
+  # 正版DP配置（当type=OfficialDP时生效）
+  use_official_dp: false  # 是否使用正版Diffusion Policy
+  num_inference_steps: 100  # 扩散推理步数
+
+# 输出
+output:
+  dir: _runs/online_training
+  save_every_n_epochs: 50
+  run_name: null  # null = 自动生成
+
+# GPU配置
+device:
+  gpu_ids: [0, 1]    # 使用的GPU列表
+  
+# 调试
+debug:
+  fast_dev_run: false  # true = 只跑 1 个 batch
+  print_config: true   # 打印配置
