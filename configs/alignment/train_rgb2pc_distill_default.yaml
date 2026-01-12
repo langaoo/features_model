@@ -1,0 +1,84 @@
+# configs/train_rgb2pc_distill_default.yaml
+# 路线2：RGB-only 蒸馏训练默认配置（支持 zarr 随机访问 + 多任务全量采样池）
+# 用法：
+#   python tools/train_rgb2pc_distill.py --config configs/train_rgb2pc_distill_default.yaml
+# 命令行参数仍可覆盖本 YAML。
+
+# 数据
+# 多任务训练：这里放你的任务列表；脚本会自动 discover (task, episode) 交集来采样
+# 你可以先放少量 task 做 sanity，再扩到全量。
+
+tasks:
+  - dump_bin_bigbin-demo_randomized-20_sapien_head_camera
+  - beat_block_hammer-demo_randomized-20_sapien_head_camera
+  - place_burger_fries-demo_randomized-20_sapien_head_camera
+  - shake_bottle-demo_randomized-20_sapien_head_camera
+  - stack_bowls_two-demo_randomized-20_sapien_head_camera
+
+# episodes=0 表示：自动 discover 可用 (task,episode) 对，不再按 0..episodes-1 猜。
+episodes: 0
+
+# 使用相对路径(相对于项目根目录)
+pc_root: pc_dataset/ulip_features_zarr
+
+# zarr roots(四模型) - 顺序必须与代码中in_dims一致: croco(1024), vggt(2048), dinov3(768), da3(2048)
+# 注意: 这个顺序决定了对齐训练时的adapter加载顺序
+vis_zarr_roots:
+  - rgb_dataset/features_croco_encoder_dict_unified_zarr   # model 0: C=1024
+  - rgb_dataset/features_vggt_encoder_dict_unified_zarr    # model 1: C=2048
+  - rgb_dataset/features_dinov3_encoder_dict_unified_zarr  # model 2: C=768
+  - rgb_dataset/features_da3_encoder_dict_unified_zarr     # model 3: C=2048
+
+# 训练
+device: cuda
+amp: true
+steps: 10000
+batch_size: 32
+# 梯度累积：在显存不变的情况下提升有效 batch。
+# effective_batch = batch_size * grad_accum_steps。
+# 对比学习通常更偏好更大的 batch（更多负样本、更稳定）。
+# 如果显存允许，也可以直接把 batch_size 调大；否则建议用累积。
+grad_accum_steps: 1
+lr: 0.0003
+seed: 0
+tau: 0.07
+num_workers: 8
+
+# 蒸馏目标
+fuse_dim: 1280
+fusion: weighted   # weighted 或 moe
+moe_hidden: 1280
+
+loss_mse: 0.0
+
+# 采样（step 或 window）
+# step: 一个样本对应一个 step（单帧）
+# window: 一个样本对应一个 window（8帧），teacher 聚合8个step，student 聚合8帧token
+sample_unit: step
+window_agg: mean
+
+# token / 点采样
+# window 模式下每帧采样 k_per_frame = student_tokens // 8，总token数仍接近 student_tokens
+student_tokens: 1024
+teacher_points: 1024
+
+# 配对
+strict_pairing: true
+pairing_fallback: error
+
+# 性能/日志
+pack_cache_size: 4
+log_every: 50
+mem_every: 0
+
+tqdm: true
+
+# wandb（需要 pip install wandb 且登录）
+wandb: true
+wandb_project: rgb2pc_distill
+wandb_entity: ""
+wandb_run_name: ""
+
+# ckpt
+save_dir: /home/gl/features_model/outputs/train_rgb2pc_runs/run_best_bs32
+save_every: 1000

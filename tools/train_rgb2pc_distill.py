@@ -1042,7 +1042,8 @@ def main() -> None:
                 "args": vars(args),
                 "adapters": adapters.state_dict(),
                 "fusion": fusion.state_dict(),
-                # [FIX] removed proj_teacher
+                "context_encoder": context_encoder.state_dict(),
+                "pos_encoder": pos_encoder.state_dict(),
                 "proj_student": proj_student.state_dict(),
                 "opt": opt.state_dict(),
             }
@@ -1058,7 +1059,8 @@ def main() -> None:
             "args": vars(args),
             "adapters": adapters.state_dict(),
             "fusion": fusion.state_dict(),
-            # [FIX] removed proj_teacher
+            "context_encoder": context_encoder.state_dict(),
+            "pos_encoder": pos_encoder.state_dict(),
             "proj_student": proj_student.state_dict(),
             "opt": opt.state_dict(),
         },
