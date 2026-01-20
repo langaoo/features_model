@@ -47,18 +47,18 @@ from croco.extract_multi_frame_croco_features import (  # noqa: E402
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="CroCo v2 统一入口：多帧滑窗特征导出（对齐 VGGT/DINOv3/DA3）")
 
-    p.add_argument("--rgb_root", type=str, default="/home/gl/features_model/rgb_dataset/RGB")
+    p.add_argument("--rgb_root", type=str, default="/home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/RGB")
     p.add_argument(
         "--out_root",
         type=str,
-        default="/home/gl/features_model/rgb_dataset/features_croco_v2_encoder_dict",
+        default="/home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_croco_v2_encoder_dict",
         help="输出根目录（将按 task/episode 保存 .pt）",
     )
 
     p.add_argument(
         "--ckpt_path",
         type=str,
-        default="/home/gl/features_model/croco/pretrained_models/CroCo_V2_ViTLarge_BaseDecoder.pth",
+        default="/home/gl/RoboTwin/policy/DP2DP3/features_model/croco/pretrained_models/CroCo_V2_ViTLarge_BaseDecoder.pth",
     )
 
     p.add_argument("--window_size", type=int, default=8)

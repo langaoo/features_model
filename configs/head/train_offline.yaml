@@ -1,0 +1,59 @@
+# ===========================
+# 离线训练配置 - 使用预提取特征
+# ===========================
+# 适用场景: 彻底离线训练，速度极快
+# 流程: extract_offline_features.py -> train_offline_head.py
+
+data:
+  # 预提取特征的目录 (由 extract_offline_features.py 生成)
+  features_dataset_dir: /home/gl/RoboTwin/policy/DP2DP3/features_model/data/offline_features
+  
+  # 数据采样参数 - 🔧 与在线训练保持一致
+  horizon: 8          # 从8改为4
+  n_obs_steps: 4      # 从2改为4历史
+  
+  # 任务列表 (需匹配已提取的特征)
+  tasks: 
+    - lift_pot
+
+  # 动作维度配置 (用于校验)
+  # 注意：必须与提取时一致
+  use_left_arm: true
+  use_right_arm: true
+  include_gripper: true # 总 14 维
+
+# 对齐编码器路径 (Deployment需要)
+encoder:
+  checkpoint: /home/gl/RoboTwin/policy/DP2DP3/features_model/outputs/train_rgb2pc_runs/run_best_bs32/ckpt_final.pt
+
+train:
+  epochs: 3000        # 离线训练非常快，可以多训练几轮
+  batch_size: 256     # 大 Batch Size
+  lr: 1e-4
+  num_workers: 8
+  
+  optimizer: adamw
+  weight_decay: 1e-6
+
+policy:
+  type: OfficialDP
+  use_official_dp: true
+  num_inference_steps: 100
+  # 隐藏层维度
+  hidden_dim: 512
+
+device:
+  gpu_ids: [0]        # Head训练显存占用小，单卡足够
+
+output:
+  dir: _runs/offline_training
+  save_every_n_epochs: 50
+
+# Checkpoint 标准化命名配置
+checkpoint:
+  expert_data_num: 50
+  ckpt_setting: demo_clean
+  seed: 0
+
+debug:
+  fast_dev_run: false

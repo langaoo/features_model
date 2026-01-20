@@ -307,17 +307,17 @@ def extract_episode(
 def main():
     ap = argparse.ArgumentParser()
 
-    ap.add_argument("--rgb_root", type=str, default="/home/gl/features_model/rgb_dataset/RGB")
+    ap.add_argument("--rgb_root", type=str, default="/home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/RGB")
     ap.add_argument(
         "--out_root",
         type=str,
-        default="/home/gl/features_model/rgb_dataset/features_depthanything3_encoder_dict",
+        default="/home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_depthanything3_encoder_dict",
     )
 
     ap.add_argument(
         "--model_dir",
         type=str,
-        default="/home/gl/features_model/Depth-Anything-3/weight",
+        default="/home/gl/RoboTwin/policy/DP2DP3/features_model/Depth-Anything-3/weight",
         help="本地权重目录（包含 config.json & model.safetensors）。",
     )
 

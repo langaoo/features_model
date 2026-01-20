@@ -373,17 +373,17 @@ def process_episode(
 
 def main():
     parser = argparse.ArgumentParser(description="使用 CroCo v2 提取多帧滑窗的 encoder 特征并保存")
-    parser.add_argument("--dataset_root", type=str, default="/home/gl/features_model/rgb_dataset/RGB", help="数据集根目录")
+    parser.add_argument("--dataset_root", type=str, default="/home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/RGB", help="数据集根目录")
     parser.add_argument(
         "--output_root",
         type=str,
-        default="/home/gl/features_model/rgb_dataset/features_croco_v2_encoder",
+        default="/home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_croco_v2_encoder",
         help="输出根目录（将按task分子目录保存）",
     )
     parser.add_argument(
         "--ckpt_path",
         type=str,
-        default="/home/gl/features_model/croco/pretrained_models/CroCo_V2_ViTLarge_BaseDecoder.pth",
+        default="/home/gl/RoboTwin/policy/DP2DP3/features_model/croco/pretrained_models/CroCo_V2_ViTLarge_BaseDecoder.pth",
         help="CroCo v2 checkpoint路径",
     )
     parser.add_argument("--window_size", type=int, default=8, help="滑动窗口大小（帧数）")

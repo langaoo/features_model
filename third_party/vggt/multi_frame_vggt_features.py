@@ -147,10 +147,10 @@ def process_episode(model, episode_path, output_dir, window_size=8, stride=1, de
 
 def main():
     parser = argparse.ArgumentParser(description="Extract VGGT features from multi-frame episodes.")
-    # 默认路径改为当前workspace（/home/gl/features_model），方便和CroCo/DINOv3统一落到同一份rgb_dataset下
-    parser.add_argument("--dataset_root", type=str, default="/home/gl/features_model/rgb_dataset/RGB", help="Path to the dataset root")
-    parser.add_argument("--output_root", type=str, default="/home/gl/features_model/rgb_dataset/features_vggt", help="Path to save features")
-    parser.add_argument("--model_path", type=str, default="/home/gl/features_model/vggt/weight/model.pt", help="Path to the model weights")
+    # 默认路径改为当前workspace（/home/gl/RoboTwin/policy/DP2DP3/features_model），方便和CroCo/DINOv3统一落到同一份rgb_dataset下
+    parser.add_argument("--dataset_root", type=str, default="/home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/RGB", help="Path to the dataset root")
+    parser.add_argument("--output_root", type=str, default="/home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_vggt", help="Path to save features")
+    parser.add_argument("--model_path", type=str, default="/home/gl/RoboTwin/policy/DP2DP3/features_model/vggt/weight/model.pt", help="Path to the model weights")
     parser.add_argument("--window_size", type=int, default=8, help="Sliding window size")
     parser.add_argument("--stride", type=int, default=1, help="Sliding window stride")
     args = parser.parse_args()

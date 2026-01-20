@@ -117,16 +117,148 @@ def load_vggt_extractor(device: str = 'cuda') -> Callable:
 
 
 def load_dinov3_extractor(device: str = 'cuda') -> Callable:
-    """加载 DINOv3 特征提取器 (768 dim for ViT-B)"""
+    """加载本地DINOv3特征提取器 (768 dim for ViT-B/16) - 使用原生DinoVisionTransformer"""
     dinov3_root = REPO_ROOT / 'dinov3'
-    if str(dinov3_root) not in sys.path:
-        sys.path.insert(0, str(dinov3_root))
+    dinov3_outer_path = str(dinov3_root)
+    if dinov3_outer_path not in sys.path:
+        sys.path.insert(0, dinov3_outer_path)
     
-    # 使用 torch.hub 加载
-    model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
+    dinov3_dir = dinov3_root / 'weight' / 'B16'
+    print(f"[DINOv3] Loading from local path: {dinov3_dir}")
+    
+    # 设置离线模式
+    import os as _os
+    _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    _os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    
+    import json
+    from safetensors.torch import load_file
+    from dinov3.models.vision_transformer import DinoVisionTransformer
+    
+    # 加载config
+    config_path = dinov3_dir / "config.json"
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+    
+    patch_size = int(cfg.get("patch_size", 16))
+    image_size = int(cfg.get("image_size", 224))
+    embed_dim = int(cfg.get("hidden_size", 768))
+    depth = int(cfg.get("num_hidden_layers", 12))
+    num_heads = int(cfg.get("num_attention_heads", 12))
+    
+    # 创建模型
+    model = DinoVisionTransformer(
+        img_size=image_size,
+        patch_size=patch_size,
+        embed_dim=embed_dim,
+        depth=depth,
+        num_heads=num_heads,
+    )
+    
+    # 加载权重
+    weights_path = dinov3_dir / "model.safetensors"
+    state_dict = load_file(str(weights_path))
+    
+    # 转换HF格式到dinov3格式 - 使用与离线提取一致的转换逻辑
+    def convert_hf_to_dinov3(sd):
+        """把 HF 风格 key(embeddings.*, encoder.layer.*) 转成 dinov3 原生 key
+        
+        ⚠️ 关键：DinoVisionTransformer使用融合的qkv权重，而HF格式是分离的q/k/v
+        需要手动融合：qkv = concat([q_proj, k_proj, v_proj], dim=0)
+        
+        ⚠️ 注意：safetensors文件中键名格式为layer.X，而非encoder.layer.X
+        """
+        # Step 1: 融合q/k/v projections并立即生成转换后的key
+        fused = {}
+        to_remove = set()  # 记录要删除的原始q/k/v keys
+        
+        q_keys = [k for k in sd.keys() if '.q_proj.' in k and 'attention' in k]
+        
+        for q_key in q_keys:
+            # layer.0.attention.q_proj.weight -> blocks.0.attn.qkv.weight
+            k_key = q_key.replace('.q_proj.', '.k_proj.')
+            v_key = q_key.replace('.q_proj.', '.v_proj.')
+            
+            if k_key in sd and v_key in sd:
+                # 融合qkv weights
+                q_weight = sd[q_key]
+                k_weight = sd[k_key]
+                v_weight = sd[v_key]
+                qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+                
+                # 生成目标key: layer.0.attention.q_proj.weight -> blocks.0.attn.qkv.weight
+                target_key = q_key.replace('layer.', 'blocks.').replace('.attention.q_proj.', '.attn.qkv.')
+                fused[target_key] = qkv_weight
+                
+            # 标记原始keys为待删除（无论bias是否存在都要标记）
+            to_remove.add(q_key)
+            to_remove.add(k_key)
+            to_remove.add(v_key)
+            
+            # bias keys也要标记为删除（即使不存在或未融合）
+            q_bias_key = q_key.replace('.weight', '.bias')
+            k_bias_key = k_key.replace('.weight', '.bias')
+            v_bias_key = v_key.replace('.weight', '.bias')
+            to_remove.add(q_bias_key)
+            to_remove.add(k_bias_key)
+            to_remove.add(v_bias_key)
+            
+            # 如果所有bias都存在，才融合
+            if all(k in sd for k in [q_bias_key, k_bias_key, v_bias_key]):
+                qkv_bias = torch.cat([sd[q_bias_key], sd[k_bias_key], sd[v_bias_key]], dim=0)
+                target_bias_key = target_key.replace('.weight', '.bias')
+                fused[target_bias_key] = qkv_bias        # Step 2: 处理其他keys
+        final = {}
+        for k, v in sd.items():
+            # 跳过要删除的q/k/v keys
+            if k in to_remove:
+                continue
+            
+            nk = k
+            
+            # embeddings  - 必须在layer转换之前处理！
+            if nk.startswith('embeddings.'):
+                nk = nk.replace('embeddings.cls_token', 'cls_token')
+                nk = nk.replace('embeddings.mask_token', 'mask_token')
+                nk = nk.replace('embeddings.register_tokens', 'storage_tokens')
+                nk = nk.replace('embeddings.patch_embeddings.weight', 'patch_embed.proj.weight')
+                nk = nk.replace('embeddings.patch_embeddings.bias', 'patch_embed.proj.bias')
+            elif nk.startswith('layer.'):
+                # layer -> blocks
+                nk = nk.replace('layer.', 'blocks.')
+                
+                # attention projection
+                nk = nk.replace('.attention.o_proj.', '.attn.proj.')
+                
+                # MLP - 普通MLP，不是gated
+                nk = nk.replace('.mlp.up_proj.', '.mlp.fc1.')
+                nk = nk.replace('.mlp.down_proj.', '.mlp.fc2.')
+                
+                # norms - 保持不变
+                
+                # layer scales
+                nk = nk.replace('.layer_scale1.lambda1', '.ls1.gamma')
+                nk = nk.replace('.layer_scale2.lambda1', '.ls2.gamma')
+            
+            # token参数形状对齐
+            if nk == 'mask_token' and len(v.shape) == 3 and v.shape[0] == 1 and v.shape[1] == 1:
+                v = v.squeeze(1)
+            if nk == 'cls_token' and v.ndim == 2 and v.shape[0] == 1:
+                v = v.unsqueeze(1)
+            
+            final[nk] = v
+        
+        # 合并融合的qkv
+        final.update(fused)
+        return final
+        return final
+    
+    state_dict = convert_hf_to_dinov3(state_dict)
+    model.load_state_dict(state_dict, strict=False)
     model.to(device)
     model.eval()
     
+    # 创建transform
     transform = T.Compose([
         T.Resize((224, 224)),
         T.ToTensor(),
@@ -135,10 +267,13 @@ def load_dinov3_extractor(device: str = 'cuda') -> Callable:
     
     @torch.no_grad()
     def extract_dinov3(img: Image.Image) -> np.ndarray:
-        """Extract DINOv3 feature (768 dim)"""
+        """Extract DINOv3 feature (768 dim) - 使用patch tokens全局平均池化"""
         x = transform(img).unsqueeze(0).to(device)  # [1, 3, 224, 224]
-        feat = model(x)  # [1, 768]
-        return feat.cpu().numpy().squeeze(0)  # [768]
+        outputs = model.forward_features(x)
+        # ⚠️ 关键修复：与训练时一致，使用patch tokens的全局平均池化
+        patch_tokens = outputs['x_norm_patchtokens']  # [1, 196, 768]
+        feat = patch_tokens.mean(dim=1)  # [1, 768]
+        return feat.cpu().float().numpy().squeeze(0)  # [768]
     
     return extract_dinov3
 

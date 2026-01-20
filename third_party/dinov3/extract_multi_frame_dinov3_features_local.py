@@ -6,7 +6,7 @@
 - 特征以 .pt 形式保存到 output_root/task_name/episode_name.pt。
 
 关键约束（符合你的要求）
-- 只使用本地权重：默认从 /home/gl/features_model/dinov3/weight 加载（该目录包含 config.json、preprocessor_config.json、model.safetensors 等）。
+- 只使用本地权重：默认从 /home/gl/RoboTwin/policy/DP2DP3/features_model/dinov3/weight 加载（该目录包含 config.json、preprocessor_config.json、model.safetensors 等）。
 - 不会访问互联网：显式设置 TRANSFORMERS_OFFLINE=1；并要求 model_dir 为本地目录。
 - 不修改任何已有文件：这是一个独立新文件。
 - 注释与说明全部中文。
@@ -197,7 +197,7 @@ def fuse_window_features(
 def load_local_hf_dinov3(model_dir: str, device: str) -> Tuple[torch.nn.Module, dict]:
     """从本地目录加载 DINOv3（禁止联网）。
 
-    你提供的路径：/home/gl/features_model/dinov3/weight
+    你提供的路径：/home/gl/RoboTwin/policy/DP2DP3/features_model/dinov3/weight
     该目录包含：
     - config.json
     - preprocessor_config.json
@@ -984,13 +984,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--rgb_root",
         type=str,
-        default="/home/gl/features_model/rgb_dataset/RGB",
+        default="/home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/RGB",
         help="数据集根目录，结构应为 rgb_root/task_name/episode_name/*.png",
     )
     p.add_argument(
         "--out_root",
         type=str,
-        default="/home/gl/features_model/rgb_dataset/features_dinov3_encoder_dict",
+        default="/home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_dinov3_encoder_dict",
         help=(
             "特征保存根目录（dict 格式，对齐 CroCo/VGGT/DA3），"
             "输出为 out_root/task_name/episode_name.pt"
@@ -1040,7 +1040,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--model_dir",
         type=str,
-        default="/home/gl/features_model/dinov3/weight",
+        default="/home/gl/RoboTwin/policy/DP2DP3/features_model/dinov3/weight",
         help=(
             "本地 DINOv3 HF safetensors 目录（7B 权重）。"
             "默认保留仅用于 CPU 跑；GPU 16GB 上会 OOM。"

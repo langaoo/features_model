@@ -7,35 +7,37 @@
 
 # 数据路径
 data:
-  raw_data_root: raw_data            # 原始数据根目录（包含HDF5文件）
-  camera_name: head_camera           # 相机名称
+  # RoboTwin 数据根目录（自动拼接路径）
+  robotwin_data_root: /home/gl/RoboTwin/data  # RoboTwin 数据根目录
+  task_config: demo_clean                 # 任务配置（demo_clean/demo_randomized等）
+  camera_name: head_camera                     # 相机名称
   
   # 任务列表
   tasks: 
-    - beat_block_hammer
+    - lift_pot
   
-  # 数据采样
-  horizon: 8          # 预测未来 8 步
-  n_obs_steps: 2      # 观测 2 帧
+  # 数据采样 - 🔧 修复：缩短 horizon，增加观测窗口
+  horizon: 4          # 从8改为4：减少Open-loop误差累积（80ms vs 160ms）
+  n_obs_steps: 4      # 从2改为4：增加历史信息，捕捉动态
   
   # 双臂配置
   use_left_arm: true
   use_right_arm: true
   fuse_arms: true
-  include_gripper: false
+  include_gripper: true
 
 # 对齐编码器
 encoder:
-  checkpoint: /home/gl/features_model/outputs/train_rgb2pc_runs/run_best_bs32/ckpt_step_0010000.pt
+  checkpoint: /home/gl/RoboTwin/policy/DP2DP3/features_model/outputs/train_rgb2pc_runs/run_best_bs32/ckpt_final.pt
   freeze: true  # 冻结对齐编码器
 
 # 训练配置
 train:
   epochs: 500
-  batch_size: 4      # ✓ 批量提取模式下可以使用更大的batchsize (8-32)
+  batch_size: 8      # ✓ 批量提取模式下可以使用更大的batchsize (8-32)
   batch_extract: true # ★ 关键参数: 启用批量特征提取模式
   lr: 1e-4
-  num_workers: 0      # 批量模式下可以使用多worker
+  num_workers: 8      # 批量模式下可以使用多worker
   
   # 优化器
   optimizer: adamw
@@ -59,6 +61,13 @@ output:
   dir: _runs/online_training
   save_every_n_epochs: 50
   run_name: null  # null = 自动生成
+
+# 标准化路径配置（新增）
+# 用于保存到标准化的 checkpoints 目录
+checkpoint:
+  expert_data_num: 20           # 专家数据数量
+  ckpt_setting: demo_randomized # checkpoint 设置（demo_clean/demo_randomized等）
+  seed: 0                       # 随机种子
 
 debug:
   print_config: true

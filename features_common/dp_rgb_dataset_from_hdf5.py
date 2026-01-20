@@ -50,6 +50,8 @@ class DPRGBOnlineDataset:
         include_gripper: bool = False,
         device: str = 'cuda',
         batch_extract: bool = True,  # 新增：是否批量提取特征
+        max_episodes: int = None,     # 新增：最大episode数量
+        assume_bgr: bool = True,      # 新增：HDF5内JPEG是否按BGR写入
     ):
         self.raw_data_root = Path(raw_data_root)
         self.tasks = tasks
@@ -63,6 +65,12 @@ class DPRGBOnlineDataset:
         self.include_gripper = include_gripper
         self.device = device
         self.batch_extract = batch_extract  # 新增
+        self.max_episodes = max_episodes     # 新增
+        self.assume_bgr = assume_bgr
+
+        # 动作归一化范围（与推理保持一致）
+        self.action_min = np.full(14, -3.0, dtype=np.float32)
+        self.action_max = np.full(14, 3.0, dtype=np.float32)
         
         # 缓存
         self._hdf5_cache: Dict[Tuple[str, str], h5py.File] = {}
@@ -84,29 +92,21 @@ class DPRGBOnlineDataset:
         样本格式: (task, episode_name, ep_len, hdf5_path)
         """
         for task in self.tasks:
-            # 提取基础任务名（去除后缀）
-            base_task = task.split('-demo_randomized')[0].split('_sapien_head_camera')[0].split('_head_camera')[0]
+            # 数据已经在正确的目录下，直接使用 raw_data_root
+            hdf5_dir = self.raw_data_root
             
-            # 搜索HDF5文件
-            search_paths = [
-                self.raw_data_root / task / 'demo_randomized' / 'data',
-                self.raw_data_root / base_task / 'demo_randomized' / 'data',
-                self.raw_data_root / base_task / 'data',
-            ]
-            
-            hdf5_dir = None
-            for p in search_paths:
-                if p.exists() and p.is_dir():
-                    hdf5_dir = p
-                    break
-            
-            if hdf5_dir is None:
-                print(f"[Dataset] Warning: no HDF5 data for task={task}")
+            if not hdf5_dir.exists() or not hdf5_dir.is_dir():
+                print(f"[Dataset] Error: data directory not found: {hdf5_dir}")
                 continue
             
             # 遍历所有HDF5文件
             hdf5_files = sorted(hdf5_dir.glob('episode*.hdf5'))
-            print(f"[Dataset] Found {len(hdf5_files)} HDF5 files for {base_task}")
+            
+            # 限制 episode 数量
+            if self.max_episodes is not None:
+                hdf5_files = hdf5_files[:self.max_episodes]
+            
+            print(f"[Dataset] Found {len(hdf5_files)} HDF5 files in {hdf5_dir} (max_episodes={self.max_episodes})")
             
             for hdf5_file in hdf5_files:
                 ep_name = hdf5_file.stem  # episode1, episode2, ...
@@ -184,9 +184,16 @@ class DPRGBOnlineDataset:
         rgb_bytes = hdf5[f'observation/{self.camera_name}/rgb'][frame_idx]
         
         # 解码JPEG
-        img = Image.open(io.BytesIO(rgb_bytes))
-        
-        return img.convert('RGB')
+        img = Image.open(io.BytesIO(rgb_bytes)).convert('RGB')
+
+        # HDF5 中图像由 OpenCV 写入，默认是 BGR；这里统一转换为 RGB
+        if self.assume_bgr:
+            img_np = np.array(img)
+            if img_np.ndim == 3 and img_np.shape[-1] == 3:
+                img_np = img_np[:, :, ::-1]
+                img = Image.fromarray(img_np, mode='RGB')
+
+        return img
     
     def _extract_features(self, task: str, episode: str, frame_idx: int) -> np.ndarray:
         """
@@ -210,26 +217,32 @@ class DPRGBOnlineDataset:
         
         actions = []
         
+        # 动作起点：对齐到观测窗口之后（obs: [start_idx, start_idx+n_obs_steps-1]）
+        # 默认取 obs 后的第一步作为 action 起点
+        total_len = hdf5['joint_action/left_arm'].shape[0] if 'joint_action/left_arm' in hdf5 else hdf5['joint_action/right_arm'].shape[0]
+        action_start = min(start_idx + self.n_obs_steps, max(total_len - 1, 0))
+        action_end = min(action_start + self.horizon, total_len)
+
         # 左臂
         if self.use_left_arm:
-            left_pos = hdf5['joint_action/left_arm'][start_idx:start_idx + self.horizon]
+            left_pos = hdf5['joint_action/left_arm'][action_start:action_end]
             actions.append(left_pos)
             
             if self.include_gripper and 'joint_action/left_gripper' in hdf5:
-                left_gripper = hdf5['joint_action/left_gripper'][start_idx:start_idx + self.horizon]
+                left_gripper = hdf5['joint_action/left_gripper'][action_start:action_end]
                 left_gripper = left_gripper.reshape(-1, 1)
                 actions.append(left_gripper)
         
         # 右臂
         if self.use_right_arm:
-            right_pos = hdf5['joint_action/right_arm'][start_idx:start_idx + self.horizon]
+            right_pos = hdf5['joint_action/right_arm'][action_start:action_end]
             if self.fuse_arms:
                 actions.append(right_pos)
             else:
                 actions = [right_pos]
             
             if self.include_gripper and 'joint_action/right_gripper' in hdf5:
-                right_gripper = hdf5['joint_action/right_gripper'][start_idx:start_idx + self.horizon]
+                right_gripper = hdf5['joint_action/right_gripper'][action_start:action_end]
                 right_gripper = right_gripper.reshape(-1, 1)
                 actions.append(right_gripper)
         
@@ -239,6 +252,11 @@ class DPRGBOnlineDataset:
         if len(action) < self.horizon:
             pad_len = self.horizon - len(action)
             action = np.concatenate([action, np.tile(action[-1:], (pad_len, 1))], axis=0)
+        
+        # 🔧 EPDL_FIX: 线性归一化动作到 [-1, 1]
+        # 假设关节角极限大约在 [-3, 3] 之间 (涵盖了您数据的 -1.35 ~ 2.25)
+        # 这样可以大幅稳定 Diffusion 训练
+        action = 2.0 * (action - self.action_min) / (self.action_max - self.action_min) - 1.0
         
         return action.astype(np.float32)
     
@@ -343,13 +361,9 @@ class BatchCollateFn:
             for sample in batch:
                 all_images.extend(sample.images)
             
-            # 批量提取特征 [B*To, 4, 2048]
-            all_features = []
-            for img in all_images:
-                feat = self.feature_extractors(img)  # [4, 2048]
-                all_features.append(feat)
-            
-            all_features = np.stack(all_features, axis=0)  # [B*To, 4, 2048]
+            # 批量提取模式 [B*To, 4, 2048]
+            # 使用新的 extract_batch 接口
+            all_features = self.feature_extractors.extract_batch(all_images)
             
             # 重组为 [B, To, 4, 2048]
             obs = torch.from_numpy(all_features).float().reshape(B, To, 4, 2048)

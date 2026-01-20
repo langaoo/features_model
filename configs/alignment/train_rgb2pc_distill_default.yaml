@@ -9,11 +9,7 @@
 # 你可以先放少量 task 做 sanity，再扩到全量。
 
 tasks:
-  - dump_bin_bigbin-demo_randomized-20_sapien_head_camera
-  - beat_block_hammer-demo_randomized-20_sapien_head_camera
-  - place_burger_fries-demo_randomized-20_sapien_head_camera
-  - shake_bottle-demo_randomized-20_sapien_head_camera
-  - stack_bowls_two-demo_randomized-20_sapien_head_camera
+  - lift_pot-demo_clean-50_sapien_head_camera
 
 # episodes=0 表示：自动 discover 可用 (task,episode) 对，不再按 0..episodes-1 猜。
 episodes: 0
@@ -49,7 +45,9 @@ fuse_dim: 1280
 fusion: weighted   # weighted 或 moe
 moe_hidden: 1280
 
-loss_mse: 0.0
+# 🔧 关键修复：启用 MSE 损失，强制特征数值对齐
+# InfoNCE 学语义，MSE 学数值分布，二者缺一不可
+loss_mse: 1.0  # 与 InfoNCE 等权重，确保数值对齐
 
 # 采样（step 或 window）
 # step: 一个样本对应一个 step（单帧）
@@ -80,5 +78,5 @@ wandb_entity: ""
 wandb_run_name: ""
 
 # ckpt
-save_dir: /home/gl/features_model/outputs/train_rgb2pc_runs/run_best_bs32
+save_dir: /home/gl/RoboTwin/policy/DP2DP3/features_model/outputs/train_rgb2pc_runs/run_best_bs32
 save_every: 1000

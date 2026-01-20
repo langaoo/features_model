@@ -1,0 +1,42 @@
+# 单模型训练配置
+# 目的: 测试是否是融合破坏了语义
+
+# 数据配置
+data:
+  robotwin_data_root: /home/gl/RoboTwin/data
+  task_name: lift_pot
+  task_config: demo_clean
+  camera_name: head_camera
+  expert_data_num: 50
+  
+  # 使用单个模型的zarr特征 (选择DINOv3测试)
+  vis_zarr_root: /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_dinov3_encoder_dict_unified_zarr
+  
+  # 数据采样
+  horizon: 8
+  n_obs_steps: 2
+
+# 模型配置
+model:
+  name: dinov3  # 用于日志标识
+
+# 策略配置
+policy:
+  num_inference_steps: 100
+
+# 训练配置
+train:
+  epochs: 1000
+  batch_size: 32
+  lr: 0.0001
+  weight_decay: 0.000001
+  num_workers: 4
+
+# 设备配置
+device:
+  gpu_id: 0
+
+# Checkpoint配置
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_single_model/lift_pot-demo_clean-50-dinov3
+  save_every: 50

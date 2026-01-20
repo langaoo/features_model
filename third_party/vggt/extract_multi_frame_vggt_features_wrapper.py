@@ -77,7 +77,7 @@ def sliding_windows(paths: List[str], window_size: int, stride: int) -> List[Lis
 
 def _import_vggt():
     # 让脚本可以从 workspace 根目录直接运行
-    # /home/gl/features_model 是 repo 根，里面有 vggt/ (package root)
+    # /home/gl/RoboTwin/policy/DP2DP3/features_model 是 repo 根，里面有 vggt/ (package root)
     from vggt.models.vggt import VGGT  # type: ignore
     from vggt.utils.load_fn import load_and_preprocess_images  # type: ignore
 
@@ -255,12 +255,12 @@ def build_argparser() -> argparse.ArgumentParser:
     )
 
     # 统一命名（推荐使用）
-    p.add_argument("--rgb_root", type=str, default="/home/gl/features_model/rgb_dataset/RGB")
-    p.add_argument("--out_root", type=str, default="/home/gl/features_model/rgb_dataset/features_vggt_encoder_dict")
+    p.add_argument("--rgb_root", type=str, default="/home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/RGB")
+    p.add_argument("--out_root", type=str, default="/home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_vggt_encoder_dict")
     # 兼容旧命名
     p.add_argument("--dataset_root", type=str, default=None, help="[兼容] 同 --rgb_root")
     p.add_argument("--output_root", type=str, default=None, help="[兼容] 同 --out_root")
-    p.add_argument("--model_path", type=str, default="/home/gl/features_model/vggt/weight/model.pt")
+    p.add_argument("--model_path", type=str, default="/home/gl/RoboTwin/policy/DP2DP3/features_model/vggt/weight/model.pt")
 
     p.add_argument("--window_size", type=int, default=8)
     p.add_argument("--stride", type=int, default=1)

@@ -11,10 +11,10 @@
 
 python tools/convert_all_vis_roots_to_zarr.py \
   --in_roots \
-    /home/gl/features_model/rgb_dataset/features_croco_v2_encoder_dict_unified \
-    /home/gl/features_model/rgb_dataset/features_da3_encoder_dict_unified \
-    /home/gl/features_model/rgb_dataset/features_dinov3_encoder_dict_unified_safe \
-    /home/gl/features_model/rgb_dataset/features_vggt_encoder_dict_unified \
+    /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_croco_v2_encoder_dict_unified \
+    /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_da3_encoder_dict_unified \
+    /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_dinov3_encoder_dict_unified_safe \
+    /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_vggt_encoder_dict_unified \
   --out_suffix _zarr \
   --skip_existing
 

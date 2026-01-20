@@ -21,16 +21,20 @@ class MultiGPUFeatureExtractors:
     """
     
     def __init__(self, gpu_ids: list[int] = [0, 1]):
-        self.gpu_ids = gpu_ids
-        self.num_gpus = len(gpu_ids)
         self.extractors = {}
         
-        # 检查可用GPU
+        # 检查可用GPU（CUDA_VISIBLE_DEVICES已经重新编号，所以总是从0开始）
         available_gpus = torch.cuda.device_count()
-        if available_gpus < self.num_gpus:
-            print(f"[MultiGPU] 警告: 请求{self.num_gpus}张卡，但只有{available_gpus}张可用")
+        
+        # 使用相对索引：即使原始是[1]，在CUDA_VISIBLE_DEVICES=1环境下也变成了[0]
+        if len(gpu_ids) > available_gpus:
+            print(f"[MultiGPU] 警告: 请求{len(gpu_ids)}张卡，但只有{available_gpus}张可用")
             self.gpu_ids = list(range(available_gpus))
-            self.num_gpus = available_gpus
+        else:
+            # 映射到可用的相对索引
+            self.gpu_ids = list(range(min(len(gpu_ids), available_gpus)))
+        
+        self.num_gpus = len(self.gpu_ids)
         
         if self.num_gpus == 0:
             raise RuntimeError("没有可用GPU，在线训练需要GPU支持")
@@ -49,16 +53,17 @@ class MultiGPUFeatureExtractors:
         cwd = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         
         # 根据GPU数量分配模型
+        # 约定：
+        # - 2+ GPU: GPU0 跑 CroCo + DINOv3，GPU1 跑 VGGT + DA3
+        # - 1 GPU : 全部模型放同一张卡
         if self.num_gpus >= 2:
-            # 2卡或更多: CroCo+DINOv3 on GPU0, VGGT+DA3 on GPU1
             model_gpu_map = {
-                'croco': self.gpu_ids[1],
-                'dinov3': self.gpu_ids[1],
-                'vggt': self.gpu_ids[0],
-                'da3': self.gpu_ids[1],
+                'croco': self.gpu_ids[0],
+                'dinov3': self.gpu_ids[0],
+                'vggt': self.gpu_ids[1],
+                'da3': self.gpu_ids[0],
             }
         else:
-            # 单卡: 全部放GPU0 (显存紧张，可能OOM)
             print("[MultiGPU] 警告: 单GPU模式，显存可能不足！")
             model_gpu_map = {name: self.gpu_ids[0] for name in ['croco', 'dinov3', 'vggt', 'da3']}
         
@@ -208,12 +213,45 @@ class MultiGPUFeatureExtractors:
         Returns:
             features: [4, 2048] numpy array
         """
-        features = []
-        for name in ['croco', 'vggt', 'dinov3', 'da3']:
-            feat = self.extractors[name](image)
-            features.append(feat)
-        return np.stack(features, axis=0)  # [4, 2048]
+        return self.extract_batch([image])[0]
     
+    def extract_batch(self, images: List[Image.Image]) -> np.ndarray:
+        """
+        批量提取多帧特征
+        
+        Args:
+            images: List of PIL Image (RGB)
+            
+        Returns:
+            features: [B, 4, 2048] numpy array
+        """
+        # 收集各模型的 batch features: {'name': [B,2048]}
+        features_dict: dict[str, np.ndarray] = {}
+        B = len(images)
+        for name in ['croco', 'vggt', 'dinov3', 'da3']:
+            feats = self.extractors[name].extract_batch(images)
+            feats = np.asarray(feats)
+
+            # 兼容错误返回：如果返回的是 [2048]，自动扩展为 [1,2048] 并检查 B==1
+            if feats.ndim == 1:
+                feats = feats[None, :]
+
+            if feats.shape[0] != B:
+                raise RuntimeError(
+                    f"Extractor '{name}' batch size mismatch: expected {B}, got {feats.shape[0]}"
+                )
+            if feats.shape[1] != 2048:
+                raise RuntimeError(
+                    f"Extractor '{name}' feature dim mismatch: expected 2048, got {feats.shape[1]}"
+                )
+            features_dict[name] = feats
+
+        # 直接 stack 出 [B, 4, 2048]
+        return np.stack(
+            [features_dict['croco'], features_dict['vggt'], features_dict['dinov3'], features_dict['da3']],
+            axis=1,
+        )
+
     def __call__(self, image: Image.Image) -> np.ndarray:
         return self.extract(image)
 
@@ -229,15 +267,21 @@ class FeatureExtractorWrapper:
         self.device = f'cuda:{gpu_id}'
     
     def __call__(self, image: Image.Image) -> np.ndarray:
+        return self.extract_batch([image])[0]
+
+    def extract_batch(self, images: List[Image.Image]) -> np.ndarray:
         """
-        提取特征并pad到2048维
+        批量提取特征并pad到2048维
         
         Args:
-            image: PIL Image
+            images: List of PIL Image
         
         Returns:
-            feat: [2048] numpy array
+            feats: [B, 2048] numpy array
         """
+        B = len(images)
+        features = []
+        
         with torch.no_grad():
             # 预处理（根据模型类型）
             if self.model_name == 'croco':
@@ -247,10 +291,13 @@ class FeatureExtractorWrapper:
                     transforms.ToTensor(),
                     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
                 ])
-                img_tensor = transform(image).unsqueeze(0).to(self.device)
-                # 使用CroCo的_encode_image方法
-                feat = self.model._encode_image(img_tensor, do_mask=False)[0]  # [1, N, C]
-                feat = feat.mean(dim=1).squeeze(0).cpu().numpy()  # [C]
+                # 批量转换
+                img_tensors = torch.stack([transform(img) for img in images]).to(self.device) # [B, 3, 224, 224]
+                
+                # CroCo 批量推理
+                # _encode_image: [B, 3, H, W] -> [B, N, C]
+                feat = self.model._encode_image(img_tensors, do_mask=False)[0]  # [B, N, C]
+                feat = feat.mean(dim=1).cpu().numpy()  # [B, C]
             
             elif self.model_name == 'dinov3':
                 from torchvision import transforms
@@ -259,76 +306,122 @@ class FeatureExtractorWrapper:
                     transforms.ToTensor(),
                     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
                 ])
-                img_tensor = transform(image).unsqueeze(0).to(self.device)
-                feat = self.model(img_tensor)  # [1, 1024]
-                feat = feat.squeeze(0).cpu().numpy()
+                img_tensors = torch.stack([transform(img) for img in images]).to(self.device) # [B, 3, 224, 224]
+                
+                # DINOv3 批量推理
+                feat = self.model(img_tensors)  # [B, 1024]
+                feat = feat.cpu().numpy() # [B, 1024]
             
             elif self.model_name == 'vggt':
                 from torchvision import transforms
                 from vggt.utils.load_fn import load_and_preprocess_images
-                
-                # VGGT需要从文件加载，先保存临时文件
                 import tempfile
-                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-                    temp_path = f.name
-                    image.save(temp_path)
+                import os as _os
                 
+                temp_paths = []
                 try:
-                    imgs = load_and_preprocess_images([temp_path])  # [1, 3, 518, 518]
-                    imgs = imgs.unsqueeze(0).to(self.device)  # [1, 1, 3, 518, 518]
+                    # 批量保存临时文件
+                    for img in images:
+                        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+                            temp_paths.append(f.name)
+                            img.save(f.name)
+                    
+                    # 批量加载和预处理
+                    # load_and_preprocess_images returns [B, 3, 518, 518]
+                    imgs = load_and_preprocess_images(temp_paths)
+                    imgs = imgs.unsqueeze(1).to(self.device) # [B, 1, 3, 518, 518] (VGGT expects [B, T, ...])
                     
                     # 使用aggregator提取特征
+                    # output: [List of [B, T, N, C], patch_start_idx]
                     aggregated_tokens_list, patch_start_idx = self.model.aggregator(imgs)
-                    last_tokens = aggregated_tokens_list[-1]  # [1, 1, N, C]
-                    patch_tokens = last_tokens[:, :, patch_start_idx:, :]  # [1, 1, Np, C]
+                    last_tokens = aggregated_tokens_list[-1]  # [B, 1, N, C]
+                    patch_tokens = last_tokens[:, :, patch_start_idx:, :]  # [B, 1, Np, C]
                     
                     # 全局平均池化
-                    feat = patch_tokens.mean(dim=[1, 2]).squeeze(0).cpu().numpy()  # [C]
+                    feat = patch_tokens.mean(dim=[1, 2]).cpu().numpy()  # [B, C]
+
                 finally:
-                    import os as _os
-                    _os.unlink(temp_path)
+                    for p in temp_paths:
+                        if _os.path.exists(p):
+                            _os.unlink(p)
             
             elif self.model_name == 'da3':
-                # DA3使用backbone提取特征
                 import tempfile
-                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-                    temp_path = f.name
-                    image.save(temp_path)
+                import os as _os
                 
-                try:
+                # DA3 的 API 在不同版本里 batch 行为不一致。
+                # 为了保证稳定性：
+                # 1) 尝试真正 batch；
+                # 2) 如果 batch 后得到的输出行数 != B，则退化为逐张处理（但仍在 GPU 上）。
+
+                def _da3_forward_from_paths(paths: list[str]) -> np.ndarray:
                     imgs_cpu, _, _ = self.model._preprocess_inputs(
-                        [temp_path],
+                        paths,
                         extrinsics=None,
                         intrinsics=None,
                         process_res=518,
                         process_res_method='lower_bound_resize',
                     )
                     imgs, _, _ = self.model._prepare_model_inputs(imgs_cpu, None, None)
+                    if isinstance(imgs, (list, tuple)):
+                        img_list = []
+                        for x in imgs:
+                            if isinstance(x, torch.Tensor):
+                                if x.ndim == 3:
+                                    x = x.unsqueeze(0)
+                                img_list.append(x)
+                        if len(img_list) == 0:
+                            raise RuntimeError("DA3 _prepare_model_inputs returned empty list")
+                        imgs = torch.cat(img_list, dim=0)
+                    if not isinstance(imgs, torch.Tensor):
+                        raise RuntimeError(f"DA3 _prepare_model_inputs returned unexpected type: {type(imgs)}")
+
                     imgs = imgs.to(self.device)
-                    
-                    # 使用backbone提取特征（与extract_multi_frame脚本一致）
-                    with torch.no_grad():
-                        backbone = self.model.model.backbone
-                        feats, _ = backbone(x=imgs, export_feat_layers=[-1])  # 导出最后一层
-                        
-                        if not feats:
-                            raise RuntimeError("backbone返回空特征")
-                        
-                        tokens, _ = feats[0]  # [B, N, num_patches, C]
-                        # 全局平均池化：对N和num_patches维度取平均
-                        feat = tokens.mean(dim=[1, 2]).squeeze(0).cpu().numpy()  # [C]
-                
+                    backbone = self.model.model.backbone
+                    feats, _ = backbone(x=imgs, export_feat_layers=[-1])
+                    if not feats:
+                        raise RuntimeError("backbone返回空特征")
+                    tokens, _ = feats[0]
+                    return tokens.mean(dim=[1, 2]).detach().cpu().numpy()
+
+                temp_paths = []
+                try:
+                    for img in images:
+                        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+                            temp_paths.append(f.name)
+                            img.save(f.name)
+
+                    # 先尝试 batch
+                    feat = _da3_forward_from_paths(temp_paths)  # 期望 [B, C]
+                    if feat.ndim == 1:
+                        feat = feat[None, :]
+
+                    if feat.shape[0] != B:
+                        # 回退逐张
+                        per_feats = []
+                        for p in temp_paths:
+                            f = _da3_forward_from_paths([p])
+                            if f.ndim == 1:
+                                f = f[None, :]
+                            per_feats.append(f[0])
+                        feat = np.stack(per_feats, axis=0)
+
                 finally:
-                    import os as _os
-                    _os.unlink(temp_path)
+                    for p in temp_paths:
+                        if _os.path.exists(p):
+                            _os.unlink(p)
             
             else:
                 raise ValueError(f"Unknown model: {self.model_name}")
         
-        # Pad到2048维
-        if len(feat) < 2048:
-            feat = np.pad(feat, (0, 2048 - len(feat)), mode='constant')
-        elif len(feat) > 2048:
-            feat = feat[:2048]
-        
-        return feat
+        # 批量 Pad 到 2048 维
+        batch_feats = []
+        for f in feat:
+            if len(f) < 2048:
+                f = np.pad(f, (0, 2048 - len(f)), mode='constant')
+            elif len(f) > 2048:
+                f = f[:2048]
+            batch_feats.append(f)
+            
+        return np.stack(batch_feats, axis=0)
+
