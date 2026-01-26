@@ -39,7 +39,7 @@ from torch.utils.data import Dataset
 
 from features_common.zarr_pack import load_zarr_pack
 
-
+# 发现所有可训练 (task, episode) 对
 def _discover_pairs(
     pc_root: Path,
     vis_zarr_roots: list[Path],
@@ -89,13 +89,13 @@ def _discover_pairs(
 
     return pairs
 
-
+# extract step stem from path
 def _step_stem_from_path(p: str) -> str:
     # path ends with step_XXXX.png / step_XXXX.jpg
     name = Path(p).name
     return Path(name).stem
 
-
+# single sample returned by RGB2PCDistillDataset
 @dataclass
 class DistillSample:
     task: str
@@ -109,7 +109,7 @@ class DistillSample:
     # student
     tokens_by_model: Optional[list[torch.Tensor]] = None  # list of [K,C_i] on CPU
 
-
+# RGB2PCDistillDataset
 class RGB2PCDistillDataset(Dataset[DistillSample]):
     def __init__(
         self,
@@ -123,6 +123,7 @@ class RGB2PCDistillDataset(Dataset[DistillSample]):
         teacher_points: int,
         strict_pairing: bool,
         pairing_fallback: str,
+        student_pool: str = "tokens",
         seed: int = 0,
     ):
         self.pc_root = Path(pc_root)
@@ -134,36 +135,40 @@ class RGB2PCDistillDataset(Dataset[DistillSample]):
         self.teacher_points = int(teacher_points)
         self.strict_pairing = bool(strict_pairing)
         self.pairing_fallback = str(pairing_fallback)
+        self.student_pool = str(student_pool)
 
+        # 初始化随机数生成器，保证采样的随机性可复现。
         self.rng = random.Random(int(seed))
-
+        # 发现所有可用 (task, episode) 对
         self.pairs = _discover_pairs(self.pc_root, self.vis_zarr_roots, self.tasks, self.episodes)
         if len(self.pairs) == 0:
             raise RuntimeError("No available (task,episode) pairs found. Check roots and task list.")
 
-        # worker-local caches (created lazily)
+        # worker-local caches (created lazily)  定义两个懒加载缓存（Worker 内创建，避免跨进程共享）：
         self._pack_cache: dict[tuple[int, str, str], Any] = {}
         self._frame_index_cache: dict[tuple[int, str, str], dict[str, tuple[int, int]]] = {}
-
+    
     def __len__(self) -> int:
         # streaming dataset: length is artificial; DataLoader will sample endlessly by cycling
         # Keep it large so that epoch semantics are not relied upon.
         return 10_000_000
-
+    # 加载并缓存 zarr 特征包
     def _get_pack(self, root_i: int, task: str, episode: str):
         key = (int(root_i), task, episode)
         pack = self._pack_cache.get(key)
+        # 检查缓存，无则调用load_zarr_pack加载.zarr 文件，存入_pack_cache
         if pack is None:
             zp = self.vis_zarr_roots[root_i] / task / f"{episode}.zarr"
             pack = load_zarr_pack(zp)
             self._pack_cache[key] = pack
         return pack
-
+    # 构建并缓存帧索引（step_stem -> (wi,ti)）
     def _get_frame_index(self, root_i: int, task: str, episode: str) -> dict[str, tuple[int, int]]:
         key = (int(root_i), task, episode)
         idx = self._frame_index_cache.get(key)
         if idx is not None:
             return idx
+        # build frame index and cache
         pack = self._get_pack(root_i, task, episode)
         # build map: step_stem -> (wi,ti)
         m: dict[str, tuple[int, int]] = {}
@@ -173,10 +178,11 @@ class RGB2PCDistillDataset(Dataset[DistillSample]):
                     m[_step_stem_from_path(str(p))] = (int(wi), int(ti))
         self._frame_index_cache[key] = m
         return m
-
+    # 随机采样一个 (task, episode) 对
     def _sample_task_episode(self) -> tuple[str, str]:
         return self.rng.choice(self.pairs)
-
+    
+    # 采样 teacher step 点云特征
     def _sample_teacher_step_points(self, task: str, episode: str) -> torch.Tensor:
         # choose a random ulip step file (Zarr)
         ep_dir = self.pc_root / task / episode
@@ -185,6 +191,7 @@ class RGB2PCDistillDataset(Dataset[DistillSample]):
         if not steps:
             # fallback to .pt if no zarr found (backward compatibility)
             steps = sorted(ep_dir.glob("step_*.ply.ulip_*.pt"))
+            # no steps found
             if not steps:
                 raise FileNotFoundError(f"no teacher steps (zarr/pt): {ep_dir}")
 
@@ -207,7 +214,7 @@ class RGB2PCDistillDataset(Dataset[DistillSample]):
         k = min(int(self.teacher_points), n)
         idx = torch.randint(0, n, (k,), device="cpu")
         return pc_feat[idx]  # [K,D]
-
+    # 采样 teacher window embedding
     def _teacher_window_embed(self, task: str, episode: str, frame_paths: list[str]) -> torch.Tensor:
         # aggregate 8 steps into one [D]
         z_list: list[torch.Tensor] = []
@@ -222,7 +229,7 @@ class RGB2PCDistillDataset(Dataset[DistillSample]):
                 z_list.append(pc_feat.mean(dim=0))
                 continue
 
-            # fallback to pt
+            # fallback to pt 优先读取.zarr 格式的点云特征，无则降级到.pt 格式
             cand = sorted(ep_dir.glob(f"{stem}.ply.ulip_*.pt"))
             if cand:
                 obj = torch.load(str(cand[0]), map_location="cpu", weights_only=False)
@@ -233,10 +240,12 @@ class RGB2PCDistillDataset(Dataset[DistillSample]):
         if not z_list:
             raise RuntimeError(f"teacher window embed empty: {task}/{episode}")
         return torch.stack(z_list, dim=0).mean(dim=0)  # [D]
-
+    # 采样 student step tokens（固定 K）
     def _sample_tokens_fixedK_step(self, pack: Any, *, root_i: int, task: str, episode: str, step_stem: str) -> torch.Tensor:
         # returns [K,C]
+        # 对每个视觉模型，调用_sample_tokens_fixedK_step采样student_tokens个 Token
         K = int(self.student_tokens)
+        # 根据step_stem查找对应的 RGB 帧，无则触发兜底策略；
         if self.strict_pairing:
             idx = self._get_frame_index(root_i, task, episode)
             if step_stem in idx:
@@ -251,6 +260,7 @@ class RGB2PCDistillDataset(Dataset[DistillSample]):
                 wi = self.rng.randrange(int(pack.arr.shape[0]))
                 ti = self.rng.randrange(int(pack.arr.shape[1]))
                 x = pack.get_frame(int(wi), int(ti))
+        # 随机采样 RGB 帧
         else:
             wi = self.rng.randrange(int(pack.arr.shape[0]))
             ti = self.rng.randrange(int(pack.arr.shape[1]))
@@ -260,27 +270,62 @@ class RGB2PCDistillDataset(Dataset[DistillSample]):
         if not torch.is_tensor(x):
             x = torch.from_numpy(x)
         # x: [Hf,Wf,C]
+        # 将帧特征展平为[H×W, C]，随机采样 K 个 Token，得到[K, C_i]（C_i 为该视觉模型的特征维度）
         Hf, Wf, C = x.shape
         x = x.reshape(Hf * Wf, C)
         S = int(x.shape[0])
         idx = torch.randint(0, S, (K,), device="cpu")
         return x[idx].to(torch.float32)
 
+    def _sample_mean_step(self, pack: Any, *, root_i: int, task: str, episode: str, step_stem: str) -> torch.Tensor:
+        """student_pool=mean 时，直接返回整帧均值特征 [1, C]，避免token随机采样。"""
+        if self.strict_pairing:
+            idx = self._get_frame_index(root_i, task, episode)
+            if step_stem in idx:
+                wi, ti = idx[step_stem]
+                x = pack.get_frame(int(wi), int(ti))  # [Hf,Wf,C]
+            else:
+                if self.pairing_fallback == "error":
+                    raise KeyError(f"missing step_stem={step_stem} in {task}/{episode}")
+                if self.pairing_fallback == "skip":
+                    raise RuntimeError("skip")
+                wi = self.rng.randrange(int(pack.arr.shape[0]))
+                ti = self.rng.randrange(int(pack.arr.shape[1]))
+                x = pack.get_frame(int(wi), int(ti))
+        else:
+            wi = self.rng.randrange(int(pack.arr.shape[0]))
+            ti = self.rng.randrange(int(pack.arr.shape[1]))
+            x = pack.get_frame(int(wi), int(ti))
+
+        if not torch.is_tensor(x):
+            x = torch.from_numpy(x)
+        x = x.to(torch.float32)
+        x_mean = x.mean(dim=(0, 1), keepdim=False)  # [C]
+        return x_mean.unsqueeze(0)
+    
+    # 采样 student window tokens（固定 K） 生成「8 帧 RGB 特征聚合 + 8 帧点云 ULIP 特征聚合」的配对样本
     def _sample_tokens_fixedK_window(self, pack: Any, *, wi: int) -> torch.Tensor:
         # sample K tokens from a window by uniform tokens across frames
         K = int(self.student_tokens)
         # pack.arr: [W,T,Hf,Wf,C]
         if not hasattr(pack, "arr"):
             raise RuntimeError("pack missing arr")
+        # arr shape: [W,T,Hf,Wf,C]
         _W, T, _Hf, _Wf, _C = pack.arr.shape
+        # uniform sampling: 每帧采样 K/T 个 token
         per = max(1, K // max(1, T))
+        # sample tokens from each frame
         toks_all: list[torch.Tensor] = []
         for ti in range(int(T)):
+            # get frame features
             x = pack.get_frame(int(wi), int(ti))
+            # zarr pack returns numpy; unify to torch
             if not torch.is_tensor(x):
                 x = torch.from_numpy(x)
+            # x: [Hf,Wf,C]
             x = x.reshape(-1, x.shape[-1])
             S = int(x.shape[0])
+            # 随机采样 per 个 token
             idx = torch.randint(0, S, (per,), device="cpu")
             toks_all.append(x[idx])
         out = torch.cat(toks_all, dim=0)
@@ -288,9 +333,19 @@ class RGB2PCDistillDataset(Dataset[DistillSample]):
         if out.shape[0] >= K:
             out = out[:K]
         else:
+            # 不足 K 则重复采样补齐
             pad = out[torch.randint(0, out.shape[0], (K - out.shape[0],), device="cpu")]
             out = torch.cat([out, pad], dim=0)
         return out.contiguous().to(torch.float32)
+
+    def _sample_mean_window(self, pack: Any, *, wi: int) -> torch.Tensor:
+        """student_pool=mean 时，返回window内时空均值特征 [1,C]。"""
+        x = pack.get_window(int(wi))  # [T,Hf,Wf,C]
+        if not torch.is_tensor(x):
+            x = torch.from_numpy(x)
+        x = x.to(torch.float32)
+        x_mean = x.mean(dim=(0, 1, 2), keepdim=False)  # [C]
+        return x_mean.unsqueeze(0)
 
     def __getitem__(self, idx: int) -> DistillSample:
         # ignore idx; sample randomly
@@ -306,7 +361,10 @@ class RGB2PCDistillDataset(Dataset[DistillSample]):
             if packs[0].frame_paths is None:
                 raise RuntimeError("frame_paths missing in pack")
             t_embed = self._teacher_window_embed(task, episode, packs[0].frame_paths[wi])
-            toks_by_model = [self._sample_tokens_fixedK_window(p, wi=wi) for p in packs]
+            if self.student_pool == "mean":
+                toks_by_model = [self._sample_mean_window(p, wi=wi) for p in packs]
+            else:
+                toks_by_model = [self._sample_tokens_fixedK_window(p, wi=wi) for p in packs]
             return DistillSample(task=task, episode=episode, sample_unit="window", teacher_embed=t_embed, tokens_by_model=toks_by_model)
 
         # step mode
@@ -332,9 +390,14 @@ class RGB2PCDistillDataset(Dataset[DistillSample]):
             toks_by_model: list[torch.Tensor] = []
             for i, p in enumerate(packs):
                 try:
-                    toks_by_model.append(
-                        self._sample_tokens_fixedK_step(p, root_i=i, task=task, episode=episode, step_stem=stem)
-                    )
+                    if self.student_pool == "mean":
+                        toks_by_model.append(
+                            self._sample_mean_step(p, root_i=i, task=task, episode=episode, step_stem=stem)
+                        )
+                    else:
+                        toks_by_model.append(
+                            self._sample_tokens_fixedK_step(p, root_i=i, task=task, episode=episode, step_stem=stem)
+                        )
                 except RuntimeError as e:
                     if str(e) == "skip":
                         return self.__getitem__(idx + 1)
@@ -361,7 +424,12 @@ class RGB2PCDistillDataset(Dataset[DistillSample]):
         toks_by_model: list[torch.Tensor] = []
         for i, p in enumerate(packs):
             try:
-                toks_by_model.append(self._sample_tokens_fixedK_step(p, root_i=i, task=task, episode=episode, step_stem=stem))
+                if self.student_pool == "mean":
+                    toks_by_model.append(
+                        self._sample_mean_step(p, root_i=i, task=task, episode=episode, step_stem=stem)
+                    )
+                else:
+                    toks_by_model.append(self._sample_tokens_fixedK_step(p, root_i=i, task=task, episode=episode, step_stem=stem))
             except RuntimeError as e:
                 if str(e) == "skip":
                     # resample another item

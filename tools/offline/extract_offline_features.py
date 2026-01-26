@@ -119,6 +119,10 @@ def extract_episode(
             aligned_feats = aligned_feats.squeeze(1) # [B, 1280]
             
         all_aligned_feats.append(aligned_feats.cpu().numpy())
+
+        # 释放显存，避免长序列处理时显存累积
+        del raw_feats, raw_tensor, aligned_feats
+        torch.cuda.empty_cache()
     
     f.close()
     

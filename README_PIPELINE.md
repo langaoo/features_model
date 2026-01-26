@@ -14,9 +14,9 @@
 
 | :--- | :--- | :--- |
 
-1. **[DP RGB 4模型流水线](docs/DP_RGB_4MODELS_PIPELINE.md)** ⭐ **必读**| `tools/run_extract_features.py` | **RGB特征提取入口**。统一调用 CroCo/VGGT/DINOv3/DA3 提取特征并直接保存为 `.zarr`。 | ✅ 核心 |
+1. **[DP RGB 4模型流水线](docs/DP_RGB_4MODELS_PIPELINE.md)** ⭐ **必读**| `tools/features/run_extract_features.py` | **RGB特征提取入口**。统一调用 CroCo/VGGT/DINOv3/DA3 提取特征并直接保存为 `.zarr`。 | ✅ 核心 |
 
-   - 4模型特征提取 → 冻结对齐encoder → Diffusion Policy head| `tools/extract_ulip_features_to_zarr.py` | **点云特征提取**。使用 ULIP 模型提取点云特征并直接保存为 `.zarr`。 | ✅ 核心 |
+  - 4模型特征提取 → 冻结对齐encoder → Diffusion Policy head| `tools/features/extract_ulip_features_to_zarr.py` | **点云特征提取**。使用 ULIP 模型提取点云特征并直接保存为 `.zarr`。 | ✅ 核心 |
 
    - 包含训练/推理入口、shape契约、常见坑| `tools/train_rgb2pc_distill.py` | **训练脚本**。执行 Student (RGB) 到 Teacher (PC) 的蒸馏训练。 | ✅ 核心 |
 
@@ -48,7 +48,7 @@
 
    - 对齐 8 帧训练是否合理？合理（数据增强）
 
-   - 新数据泛化：同任务可以，跨任务需重新训练使用 `tools/run_extract_features.py`。该脚本会调用各子目录下的提取脚本，直接输出 Zarr 格式。
+  - 新数据泛化：同任务可以，跨任务需重新训练使用 `tools/features/run_extract_features.py`。该脚本会调用各子目录下的提取脚本，直接输出 Zarr 格式。
 
 
 
@@ -56,7 +56,7 @@
 
 # 示例：提取 CroCo 特征
 
-- **[对齐流水线](docs/ALIGNMENT_PIPELINE.md)**：RGB→PC 对齐模块训练python tools/run_extract_features.py \
+-- **[对齐流水线](docs/ALIGNMENT_PIPELINE.md)**：RGB→PC 对齐模块训练python tools/features/run_extract_features.py \
 
 - **[DP RGB 单模型指南](docs/DP_RGB_GUIDE.md)**：旧单模型版本（已被 4模型替代）  --model croco \
 
@@ -82,25 +82,25 @@
 
 # 提取 4 个模型的特征（croco/vggt/dinov3/da3）---
 
-python tools/run_extract_features.py \
+python tools/features/run_extract_features.py \
 
   --model croco --rgb_root rgb_dataset/RGB --out_root rgb_dataset --device cuda --all### 第二步：点云 (ULIP) 特征提取
 
 
 
-python tools/run_extract_features.py \使用 ULIP 模型处理点云数据，作为 Teacher 信号。
+python tools/features/run_extract_features.py \使用 ULIP 模型处理点云数据，作为 Teacher 信号。
 
   --model vggt --rgb_root rgb_dataset/RGB --out_root rgb_dataset --device cuda --all
 
 ```bash
 
-python tools/run_extract_features.py \python tools/extract_ulip_features_to_zarr.py
+python tools/features/run_extract_features.py \python tools/features/extract_ulip_features_to_zarr.py
 
   --model dinov3 --rgb_root rgb_dataset/RGB --out_root rgb_dataset --device cuda --all```
 
 
 
-python tools/run_extract_features.py \*   **注意**：你需要修改脚本内的 `PC_SOURCE_DIR` 和 `OUTPUT_ZARR_DIR` 路径。
+python tools/features/run_extract_features.py \*   **注意**：你需要修改脚本内的 `PC_SOURCE_DIR` 和 `OUTPUT_ZARR_DIR` 路径。
 
   --model da3 --rgb_root rgb_dataset/RGB --out_root rgb_dataset --device cuda --all*   **过程**：
 

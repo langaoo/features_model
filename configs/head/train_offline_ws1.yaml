@@ -1,0 +1,50 @@
+# 离线训练配置 - ws1 对齐特征
+
+data:
+  features_dataset_dir: /home/gl/RoboTwin/policy/DP2DP3/features_model/data/offline_features_ws1
+
+  horizon: 8
+  n_obs_steps: 2
+
+  camera_name: head_camera
+
+  tasks:
+    - lift_pot
+
+  task_config: demo_clean
+
+  use_left_arm: true
+  use_right_arm: true
+  include_gripper: true
+
+encoder:
+  checkpoint: /home/gl/RoboTwin/policy/DP2DP3/features_model/outputs/train_rgb2pc_runs/run_ws1/ckpt_final.pt
+
+train:
+  epochs: 600
+  batch_size: 32
+  lr: 1e-4
+  num_workers: 4
+  optimizer: adamw
+  weight_decay: 1e-6
+
+policy:
+  type: OfficialDP
+  use_official_dp: true
+  num_inference_steps: 100
+  hidden_dim: 512
+
+device:
+  gpu_ids: [0,1]
+
+output:
+  dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints
+  save_every_n_epochs: 300
+
+checkpoint:
+  expert_data_num: 50
+  ckpt_setting: demo_clean
+  seed: 0
+
+debug:
+  fast_dev_run: false

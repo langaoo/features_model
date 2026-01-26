@@ -13,8 +13,8 @@ data:
     - lift_pot
   
   # 数据采样
-  horizon: 4
-  n_obs_steps: 4
+  horizon: 8
+  n_obs_steps: 2
   
   # 双臂配置
   use_left_arm: true

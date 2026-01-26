@@ -75,6 +75,25 @@ def info_nce_batch(z_t: torch.Tensor, z_s: torch.Tensor, *, tau: float = 0.07) -
     return 0.5 * (loss_s2t + loss_t2s)
 
 
+def local_align_loss(z_tokens: torch.Tensor, t_points: torch.Tensor, *, tau: float = 0.07) -> torch.Tensor:
+    """
+    局部对齐损失：token-点云集合级软匹配（无显式对应）。
+    z_tokens: [B,K,D], t_points: [B,Kt,D]
+    目标：每个token至少能“靠近”某个点，每个点也能被某些token覆盖。
+    """
+    if z_tokens.ndim != 3 or t_points.ndim != 3:
+        raise ValueError(f"local_align_loss expects [B,K,D] & [B,Kt,D], got {tuple(z_tokens.shape)} and {tuple(t_points.shape)}")
+
+    zt = F.normalize(z_tokens, dim=-1)
+    tp = F.normalize(t_points, dim=-1)
+    sim = torch.einsum("bkd,bqd->bkq", zt, tp) / float(tau)
+
+    # token->point, point->token (soft max with logsumexp)
+    tok_to_pt = torch.logsumexp(sim, dim=-1)  # [B,K]
+    pt_to_tok = torch.logsumexp(sim, dim=-2)  # [B,Kt]
+    return -0.5 * (tok_to_pt.mean() + pt_to_tok.mean())
+
+
 class MLP(nn.Module):
     """
     ✅ 通用多层感知机模块：用于特征维度适配/投影/增强
@@ -114,9 +133,28 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)  # 注册缓冲区：保存但不训练，随模型权重一起保存
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """输入x格式：[seq_len, batch_size, embedding_dim] → Transformer标准格式"""
+        """
+        输入x格式：[seq_len, batch_size, embedding_dim] → Transformer原论文格式
+        输出格式：[seq_len, batch_size, embedding_dim] → 与输入格式一致
+        """
         x = x + self.pe[:x.size(0)]  # 特征叠加位置编码，仅取前seq_len个位置的编码
         return self.dropout(x)       # dropout后返回，增强鲁棒性
+
+
+class TokenAttentionPool(nn.Module):
+    """轻量token attention pooling：学习一个query向量对token加权汇聚。"""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B,K,D]
+        if x.ndim != 3:
+            raise ValueError(f"TokenAttentionPool expects [B,K,D], got {tuple(x.shape)}")
+        dim = x.shape[-1]
+        scores = (x * self.query).sum(dim=-1) / math.sqrt(float(dim))  # [B,K]
+        weights = torch.softmax(scores, dim=1)
+        return (x * weights.unsqueeze(-1)).sum(dim=1)
 
 
 def _discover_available_pairs(
@@ -191,17 +229,37 @@ def main() -> None:
     ap.add_argument("--device", type=str, default="cuda", help="训练设备：cuda/cpu")
     ap.add_argument("--steps", type=int, default=5000, help="训练总步数（有效步数，带梯度累积）")
     ap.add_argument("--lr", type=float, default=1e-3, help="初始学习率，余弦退火自动衰减")
+    ap.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW权重衰减系数，防过拟合")  # 新增：补全缺失的参数
     ap.add_argument("--seed", type=int, default=0, help="全局随机种子，保证训练可复现")
     ap.add_argument("--tau", type=float, default=0.07, help="InfoNCE温度系数，默认0.07最优")
     ap.add_argument("--fuse_dim", type=int, default=768, help="特征融合维度，会自动适配teacher维度")
     ap.add_argument("--moe_hidden", type=int, default=256, help="MoE融合层的隐藏维度")
     ap.add_argument("--fusion", type=str, default="weighted", choices=["weighted", "moe"], help="多模型特征融合方式")
     ap.add_argument("--loss_mse", type=float, default=0.0, help="额外MSE损失权重，0则关闭")
+    ap.add_argument("--loss_rgb", type=float, default=0.0, help="RGB自对比损失权重，保持视觉语义一致性")
+    ap.add_argument("--rgb_tau", type=float, default=0.07, help="RGB自对比温度系数")
     ap.add_argument("--amp", action="store_true", help="启用AMP混合精度训练（仅CUDA生效，提速省显存）")
     ap.add_argument("--batch_size", type=int, default=8, help="单批次样本数")
     ap.add_argument("--grad_accum_steps", type=int, default=1, help="梯度累积步数，有效批次=batch_size*该值，提升对比学习稳定性")
     ap.add_argument("--student_tokens", type=int, default=1024, help="每个视觉模型采样的token数量")
     ap.add_argument("--teacher_points", type=int, default=1024, help="每个点云样本采样的点数量")
+    ap.add_argument(
+        "--student_pool",
+        type=str,
+        default="tokens",
+        choices=["tokens", "mean"],
+        help="student特征池化方式：tokens=使用token序列；mean=对token均值池化为单向量",
+    )
+    ap.add_argument(
+        "--token_pool",
+        type=str,
+        default="mean",
+        choices=["mean", "attn"],
+        help="token模式下的池化方式：mean=均值池化，attn=注意力池化",
+    )
+    ap.add_argument("--loss_local", type=float, default=0.0, help="局部token-点云对齐损失权重（无点云时自动跳过）")
+    ap.add_argument("--local_tau", type=float, default=0.07, help="局部对齐温度系数")
+    ap.add_argument("--loss_pool", type=float, default=0.0, help="token-attn与mean池化一致性损失权重")
 
     # -------------------------- 采样粒度参数 --------------------------
     ap.add_argument("--sample_unit", type=str, default="step", choices=["step", "window"], help="样本粒度：step=单帧，window=8帧窗口")
@@ -288,6 +346,7 @@ def main() -> None:
         teacher_points=int(args.teacher_points),
         strict_pairing=bool(args.strict_pairing),
         pairing_fallback=str(args.pairing_fallback),
+        student_pool=str(args.student_pool),
         seed=int(args.seed),
     )
 
@@ -318,21 +377,32 @@ def main() -> None:
         fusion = MoEFusion(dim=int(args.fuse_dim), num_models=len(packs0), hidden_dim=int(args.moe_hidden), k=2).to(device)
 
     # 5.3 位置编码+Transformer上下文编码器：增强特征的空间交互能力，提升语义表达
-    pos_encoder = PositionalEncoding(d_model=int(args.fuse_dim), dropout=0.1, max_len=int(args.student_tokens)).to(device)
-    # ✅ 修复关键BUG：动态计算n_head，保证d_model % n_head == 0，彻底避免硬编码报错
-    d_model = int(args.fuse_dim)
-    nhead = d_model // 64  # 行业通用head_dim=64，保证整除，且注意力头数合理
-    assert nhead >= 1, f"融合维度{d_model}过小，无法拆分注意力头！建议增大fuse_dim"
-    context_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=d_model*4, dropout=0.1, batch_first=True)
-    context_encoder = nn.TransformerEncoder(context_layer, num_layers=2).to(device)
+    use_token_pool = str(args.student_pool) == "tokens"
+    if use_token_pool:
+        pos_encoder = PositionalEncoding(d_model=int(args.fuse_dim), dropout=0.1, max_len=int(args.student_tokens)).to(device)
+        # ✅ 修复关键BUG：动态计算n_head，保证d_model % n_head == 0，彻底避免硬编码报错
+        d_model = int(args.fuse_dim)
+        nhead = d_model // 64  # 行业通用head_dim=64，保证整除，且注意力头数合理
+        assert nhead >= 1, f"融合维度{d_model}过小，无法拆分注意力头！建议增大fuse_dim"
+        context_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=d_model*4, dropout=0.1, batch_first=True)
+        context_encoder = nn.TransformerEncoder(context_layer, num_layers=2).to(device)
+        token_pooler = TokenAttentionPool(d_model).to(device) if str(args.token_pool) == "attn" else None
+    else:
+        pos_encoder = None
+        context_encoder = None
+        token_pooler = None
 
     # 5.4 Student特征投影层：最终映射到teacher的特征空间，无teacher投影层（固定teacher特征，核心优化）
     proj_student = MLP(in_dim=int(args.fuse_dim), out_dim=int(args.fuse_dim), hidden_dim=int(args.fuse_dim)*2).to(device)
 
     # ===================== 6. 优化器+学习率调度器配置 =====================
     # 收集所有可训练参数
-    params = list(adapters.parameters()) + list(fusion.parameters()) + list(context_encoder.parameters()) + list(proj_student.parameters())
-    opt = torch.optim.AdamW(params, lr=float(args.lr))  # AdamW带权重衰减，防过拟合
+    params = list(adapters.parameters()) + list(fusion.parameters()) + list(proj_student.parameters())
+    if context_encoder is not None:
+        params = params + list(context_encoder.parameters())
+    if token_pooler is not None:
+        params = params + list(token_pooler.parameters())
+    opt = torch.optim.AdamW(params, lr=float(args.lr), weight_decay=float(args.weight_decay))  # 修复：参数已定义，可正常使用
     # 余弦退火调度器：自动降低学习率，避免后期震荡，保证收敛到最优值
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=int(args.steps), eta_min=1e-6)
 
@@ -353,10 +423,20 @@ def main() -> None:
     # ===================== 8. DataLoader迭代器配置 =====================
     def _collate(batch: list[DistillSample]):
         """自定义数据拼接函数：适配DistillSample的结构化数据，保证批次维度正确"""
+        # 获取当前批次的样本粒度（step/window）
         unit = batch[0].sample_unit
+        # 拼接每个模型的token特征列表
+        '''[
+    [模型1特征(样本1, 1024,384), 模型2特征(样本1, 1024,512)],  # 样本1的多模型特征
+    [模型1特征(样本2, 1024,384), 模型2特征(样本2, 1024,512)]   # 样本2的多模型特征
+    ]   ->[
+    (模型1特征(样本1), 模型1特征(样本2)),
+    (模型2特征(样本1), 模型2特征(样本2))
+    ]'''
         toks_by_model = list(zip(*[b.tokens_by_model for b in batch]))
         toks = [torch.stack(list(m), dim=0) for m in toks_by_model]
         out = {"sample_unit": unit, "tokens": toks, "task": [b.task for b in batch], "episode": [b.episode for b in batch]}
+        # 根据样本粒度添加teacher特征
         if unit == "window":
             out["teacher_embed"] = torch.stack([b.teacher_embed for b in batch], dim=0)
         else:
@@ -367,9 +447,9 @@ def main() -> None:
             else:
                 raise RuntimeError("step样本缺失teacher特征！")
         return out
-
+    # 自动从dataset里取batch_size个样本，调用_collate拼接成批次，再返回给训练循环
     loader = DataLoader(
-        dataset, batch_size=int(args.batch_size), shuffle=False, num_workers=int(args.num_workers),
+        dataset, batch_size=int(args.batch_size), shuffle=True, num_workers=int(args.num_workers),
         pin_memory=bool(args.pin_memory) and device.type == "cuda",
         persistent_workers=bool(args.persistent_workers) and int(args.num_workers) > 0,
         prefetch_factor=int(args.prefetch_factor) if int(args.num_workers) > 0 else None,
@@ -402,33 +482,65 @@ def main() -> None:
         # 数据转移到设备，非阻塞传输提速
         toks_list: list[torch.Tensor] = batch["tokens"]
         toks_list = [t.to(device, non_blocking=True).to(torch.float32) for t in toks_list]
+        # ✅ 修复：特征异常值检测，替换inf/nan，避免训练崩溃
+        for i in range(len(toks_list)):
+            if not torch.isfinite(toks_list[i]).all():
+                toks_list[i] = torch.nan_to_num(toks_list[i], nan=0.0, posinf=1e6, neginf=-1e6)
 
         # -------------------------- 前向传播：特征处理+损失计算 --------------------------
+        loss_rgb_val: float | None = None
         with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-            B, K = toks_list[0].shape[:2]  # B=批次，K=token数量
+            if use_token_pool:
+                B, K = toks_list[0].shape[:2]  # B=批次，K=token数量
 
-            # 1. 视觉特征适配：每个模型的特征通过MLP统一维度
-            z_tokens_list = []
-            for mi, toks in enumerate(toks_list):
-                z = adapters[mi](toks.reshape(B * K, -1)).reshape(B, K, -1)
-                z_tokens_list.append(z)
-            
-            # 2. 多模型特征融合：token级融合，兼顾不同模型的语义优势
-            z_flat_list = [z.reshape(B*K, -1) for z in z_tokens_list]
-            z_fused_flat, _ = fusion(z_flat_list)
-            z_fused_tokens = z_fused_flat.reshape(B, K, -1)
-            
-            # 3. 位置编码+上下文增强：添加空间位置信息 + Transformer空间交互
-            z_fused_tokens = z_fused_tokens.transpose(0, 1)  # PE要求格式：[seq_len, batch, dim]
-            z_fused_tokens = pos_encoder(z_fused_tokens)
-            z_fused_tokens = z_fused_tokens.transpose(0, 1)  # 转回：[batch, seq_len, dim]
-            z_enhanced = context_encoder(z_fused_tokens)
-            
-            # 4. 全局池化：集合级特征对齐，得到样本级全局特征 [B, D]
-            z_final = z_enhanced.mean(dim=1)
+                # 1. 视觉特征适配：每个模型的特征通过MLP统一维度
+                z_tokens_list = []
+                for mi, toks in enumerate(toks_list):
+                    z = adapters[mi](toks.reshape(B * K, -1)).reshape(B, K, -1)
+                    z_tokens_list.append(z)
+                
+                # 2. 多模型特征融合：token级融合，兼顾不同模型的语义优势
+                z_flat_list = [z.reshape(B*K, -1) for z in z_tokens_list]
+                z_fused_flat, _ = fusion(z_flat_list)
+                z_fused_tokens = z_fused_flat.reshape(B, K, -1)
+                
+                # 3. 位置编码+上下文增强：添加空间位置信息 + Transformer空间交互
+                z_fused_tokens = z_fused_tokens.transpose(0, 1)  # 转置为[seq_len, batch, dim]适配PE格式
+                z_fused_tokens = pos_encoder(z_fused_tokens)
+                z_fused_tokens = z_fused_tokens.transpose(0, 1)  # 转回[batch, seq_len, dim]适配Transformer（batch_first=True）
+                z_enhanced = context_encoder(z_fused_tokens)
+                
+                # 4. 全局池化：集合级特征对齐，得到样本级全局特征 [B, D]
+                z_mean = z_enhanced.mean(dim=1)
+                if token_pooler is not None:
+                    z_attn = token_pooler(z_enhanced)
+                    z_final = z_attn
+                    zs_mean = proj_student(z_mean)
+                else:
+                    z_final = z_mean
+                    zs_mean = None
 
-            # 5. Student特征最终投影
-            zs = proj_student(z_final)
+                # 5. Student特征最终投影
+                zs = proj_student(z_final)
+
+                # 5.1 局部对齐：对token投影后与点云点特征做集合级对齐
+                z_tokens_proj = None
+                if float(args.loss_local) > 0 and "teacher_points" in batch:
+                    z_tokens_proj = proj_student(z_enhanced.reshape(B * K, -1)).reshape(B, K, -1)
+
+                # RGB自对比：对每个模型做token均值池化
+                z_rgb_list = [z.mean(dim=1) for z in z_tokens_list]
+            else:
+                # mean 池化模式：先对token做均值池化，再走adapter+fusion
+                z_vec_list = []
+                for mi, toks in enumerate(toks_list):
+                    toks_mean = toks.mean(dim=1)  # [B, C]
+                    z_vec_list.append(adapters[mi](toks_mean))  # [B, D]
+                z_final, _ = fusion(z_vec_list)  # [B, D]
+                zs = proj_student(z_final)
+                z_rgb_list = z_vec_list
+                zs_mean = None
+                z_tokens_proj = None
 
             # 6. Teacher特征处理：适配step/window两种模式，保证格式为[B,D]
             if str(batch["sample_unit"]) == "window":
@@ -440,18 +552,52 @@ def main() -> None:
                     tp = batch["teacher_points"].to(device, non_blocking=True).to(torch.float32)
                     zt = tp.mean(dim=1) if tp.ndim == 3 else tp
 
-            # ✅ 核心优化：启用特征中心化（必须开启！对齐效果质的飞跃）
-            # 消除batch内特征的公共模式，强制模型学习样本间的语义差异，解决teacher特征相似度极高的问题
-            zt_centered = zt - zt.mean(dim=0, keepdim=True)
-            zs_centered = zs - zs.mean(dim=0, keepdim=True)
+            # ✅ 修复：正确的归一化→中心化顺序，保持 student 梯度
+            B = int(zs.shape[0])
+            # 注意：不能把 zs 放在 no_grad 里，否则梯度为 0
+            zt_norm = F.normalize(zt, dim=-1)
+            zs_norm = F.normalize(zs, dim=-1)
+            # 第二步：中心化（仅batch_size≥2时，避免单样本特征全零）
+            if B > 1:
+                zt_centered = zt_norm - zt_norm.mean(dim=0, keepdim=True)
+                zs_centered = zs_norm - zs_norm.mean(dim=0, keepdim=True)
+            else:
+                zt_centered = zt_norm
+                zs_centered = zs_norm
             
-            # 计算核心对齐损失
+            # 计算核心对齐损失（修复：移除不存在的skip_norm参数）
             loss_nce = info_nce_batch(zt_centered, zs_centered, tau=float(args.tau))
             loss = loss_nce
             
             # 可选MSE损失：辅助对齐，权重为0则关闭
             if float(args.loss_mse) > 0:
                 loss = loss + float(args.loss_mse) * F.mse_loss(F.normalize(zs, dim=-1), F.normalize(zt, dim=-1))
+
+            # 可选RGB自对比：保持视觉语义一致性
+            if float(args.loss_rgb) > 0:
+                pair_cnt = 0
+                loss_rgb = 0.0
+                for i in range(len(z_rgb_list)):
+                    for j in range(i + 1, len(z_rgb_list)):
+                        loss_rgb = loss_rgb + info_nce_batch(z_rgb_list[i], z_rgb_list[j], tau=float(args.rgb_tau))
+                        pair_cnt += 1
+                if pair_cnt > 0:
+                    loss_rgb = loss_rgb / float(pair_cnt)
+                else:
+                    loss_rgb = torch.tensor(0.0, device=zs.device)
+                loss = loss + float(args.loss_rgb) * loss_rgb
+                loss_rgb_val = float(loss_rgb.item())
+
+            # 可选局部对齐损失（仅在有teacher_points时生效）
+            if float(args.loss_local) > 0 and "teacher_points" in batch and z_tokens_proj is not None:
+                tp = batch["teacher_points"].to(device, non_blocking=True).to(torch.float32)
+                loss_local = local_align_loss(z_tokens_proj, tp, tau=float(args.local_tau))
+                loss = loss + float(args.loss_local) * loss_local
+
+            # token-attn 与 mean 池化一致性（保持推理接口为mean）
+            if float(args.loss_pool) > 0 and zs_mean is not None:
+                loss_pool = F.mse_loss(zs_mean, zs.detach())
+                loss = loss + float(args.loss_pool) * loss_pool
 
         # -------------------------- 梯度累积：损失缩放 --------------------------
         loss_micro = loss / float(accum_steps)
@@ -483,7 +629,10 @@ def main() -> None:
         grad_norm_pre, grad_norm_post, clipped, nonfinite_grads = None, None, False, 0
         try:
             total, cnt = 0.0, 0
-            for mod in (adapters, fusion, context_encoder, proj_student):
+            mods_for_grad = [adapters, fusion, proj_student]
+            if context_encoder is not None:
+                mods_for_grad.append(context_encoder)
+            for mod in mods_for_grad:
                 for p in mod.parameters():
                     if p.grad is None: continue
                     g = p.grad.detach()
@@ -502,7 +651,10 @@ def main() -> None:
         # 计算裁剪后的梯度范数
         try:
             total2, cnt2 =0.0,0
-            for mod in (adapters, fusion, context_encoder, proj_student):
+            mods_for_grad = [adapters, fusion, proj_student]
+            if context_encoder is not None:
+                mods_for_grad.append(context_encoder)
+            for mod in mods_for_grad:
                 for p in mod.parameters():
                     if p.grad is None: continue
                     g = p.grad.detach()
@@ -523,15 +675,15 @@ def main() -> None:
                     try: scaler.update()
                     except Exception: pass
             else:
+                # 优化器更新
                 if use_amp:
                     scaler.step(opt)
                     scaler.update()
                 else:
                     opt.step()
-                scheduler.step()  # 更新学习率
+                scheduler.step()  # 更新学习率（仅有效步数更新，适配梯度累积）
                 opt.zero_grad(set_to_none=True)  # 清空梯度
                 global_step +=1
-
         # -------------------------- 日志可视化+模型保存 --------------------------
         loss_v_now = float(loss.item())
         nce_v_now = float(loss_nce.item())
@@ -561,40 +713,55 @@ def main() -> None:
 
         # 终端打印日志
         if stepped and int(args.print_every) >0 and (global_step % int(args.print_every) ==0):
-            msg = f"step={global_step} loss={loss_v_now:.4f} ema={ema_loss:.4f} nce={nce_v_now:.4f} lr={lr_v_now:.3e} pos={pos_sim:.3f} gap={sim_gap:.3f}"
+            msg = f"step={global_step} loss={loss_v_now:.4f} ema={ema_loss:.4f} nce={nce_v_now:.4f}"
+            if loss_rgb_val is not None:
+                msg += f" rgb={loss_rgb_val:.4f}"
+            msg += f" lr={lr_v_now:.3e} pos={pos_sim:.3f} gap={sim_gap:.3f}"
             if tqdm is not None: tqdm.write(msg)
             else: print(msg)
 
         # wandb日志记录
         if stepped and wb is not None and int(args.log_every) >0 and (global_step % int(args.log_every) ==0):
-            wb.log({
+            wb_payload = {
                 "loss":loss_v_now, "ema_loss":ema_loss, "nce_loss":nce_v_now, "lr":lr_v_now,
                 "grad_norm_pre":grad_norm_pre or 0, "grad_norm_post":grad_norm_post or 0,
                 "pos_sim":pos_sim, "neg_sim":neg_sim or 0, "sim_gap":sim_gap or 0,
                 "nonfinite_grads":nonfinite_grads, "stepped":1 if stepped else 0,
                 "step":global_step
-            })
+            }
+            if loss_rgb_val is not None:
+                wb_payload["rgb_loss"] = loss_rgb_val
+            wb.log(wb_payload)
 
         # 模型保存
         if stepped and int(args.save_every) >0 and (global_step % int(args.save_every) ==0):
             ckpt = {
                 "global_step":global_step, "args":vars(args),
                 "adapters":adapters.state_dict(), "fusion":fusion.state_dict(),
-                "context_encoder":context_encoder.state_dict(), "pos_encoder":pos_encoder.state_dict(),
                 "proj_student":proj_student.state_dict(), "opt":opt.state_dict()
             }
+            if context_encoder is not None and pos_encoder is not None:
+                ckpt["context_encoder"] = context_encoder.state_dict()
+                ckpt["pos_encoder"] = pos_encoder.state_dict()
+            if token_pooler is not None:
+                ckpt["token_pooler"] = token_pooler.state_dict()
             out = save_dir / f"ckpt_step_{global_step:07d}.pt"
             torch.save(ckpt, out)
             print(f"[ckpt] 保存模型: {out}")
 
     # ===================== 10. 训练结束：保存最终模型 =====================
     final_ckpt = save_dir / "ckpt_final.pt"
-    torch.save({
+    final_payload = {
         "global_step":global_step, "args":vars(args),
         "adapters":adapters.state_dict(), "fusion":fusion.state_dict(),
-        "context_encoder":context_encoder.state_dict(), "pos_encoder":pos_encoder.state_dict(),
         "proj_student":proj_student.state_dict(), "opt":opt.state_dict()
-    }, final_ckpt)
+    }
+    if context_encoder is not None and pos_encoder is not None:
+        final_payload["context_encoder"] = context_encoder.state_dict()
+        final_payload["pos_encoder"] = pos_encoder.state_dict()
+    if token_pooler is not None:
+        final_payload["token_pooler"] = token_pooler.state_dict()
+    torch.save(final_payload, final_ckpt)
     print(f"[ckpt] 训练完成，保存最终模型: {final_ckpt}")
 
 

@@ -32,7 +32,7 @@ encoder:
 # 训练配置
 train:
   epochs: 500
-  batch_size: 16      # 在线训练建议小 batch (2-4)
+  batch_size: 64      # 在线训练建议小 batch (2-4)
   lr: 1e-4
   num_workers: 0     # DataLoader workers（在线特征提取建议0）
   
@@ -52,7 +52,7 @@ policy:
 # 输出
 output:
   dir: _runs/online_training
-  save_every_n_epochs: 50
+  save_every_n_epochs: 5
   run_name: null  # null = 自动生成
 
 # GPU配置

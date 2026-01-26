@@ -15,21 +15,21 @@ tasks:
 episodes: 0
 
 # 使用相对路径(相对于项目根目录)
-pc_root: pc_dataset/ulip_features_zarr
+pc_root: /home/gl/RoboTwin/policy/DP2DP3/features_model/pc_dataset/ulip_features_zarr
 
 # zarr roots(四模型) - 顺序必须与代码中in_dims一致: croco(1024), vggt(2048), dinov3(768), da3(2048)
 # 注意: 这个顺序决定了对齐训练时的adapter加载顺序
 vis_zarr_roots:
-  - rgb_dataset/features_croco_encoder_dict_unified_zarr   # model 0: C=1024
-  - rgb_dataset/features_vggt_encoder_dict_unified_zarr    # model 1: C=2048
-  - rgb_dataset/features_dinov3_encoder_dict_unified_zarr  # model 2: C=768
-  - rgb_dataset/features_da3_encoder_dict_unified_zarr     # model 3: C=2048
+  - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_croco_encoder_dict_unified_zarr   # model 0: C=1024
+  - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_vggt_encoder_dict_unified_zarr    # model 1: C=2048
+  - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_dinov3_encoder_dict_unified_zarr  # model 2: C=768
+  - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_da3_encoder_dict_unified_zarr     # model 3: C=2048
 
 # 训练
 device: cuda
 amp: true
-steps: 10000
-batch_size: 32
+steps: 20000
+batch_size: 16
 # 梯度累积：在显存不变的情况下提升有效 batch。
 # effective_batch = batch_size * grad_accum_steps。
 # 对比学习通常更偏好更大的 batch（更多负样本、更稳定）。
@@ -48,6 +48,8 @@ moe_hidden: 1280
 # 🔧 关键修复：启用 MSE 损失，强制特征数值对齐
 # InfoNCE 学语义，MSE 学数值分布，二者缺一不可
 loss_mse: 1.0  # 与 InfoNCE 等权重，确保数值对齐
+loss_rgb: 0.1  # RGB自对比，保留视觉语义
+rgb_tau: 0.07
 
 # 采样（step 或 window）
 # step: 一个样本对应一个 step（单帧）
@@ -59,6 +61,10 @@ window_agg: mean
 # window 模式下每帧采样 k_per_frame = student_tokens // 8，总token数仍接近 student_tokens
 student_tokens: 1024
 teacher_points: 1024
+
+# ✅ 推理阶段只提供每帧全局特征（非token序列）。
+# 必须使用 mean 池化训练对齐模块，否则推理会出现特征分布不一致。
+student_pool: mean
 
 # 配对
 strict_pairing: true

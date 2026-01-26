@@ -9,8 +9,8 @@ data:
   features_dataset_dir: /home/gl/RoboTwin/policy/DP2DP3/features_model/data/offline_features
   
   # 数据采样参数 - 🔧 与在线训练保持一致
-  horizon: 8          # 从8改为4
-  n_obs_steps: 4      # 从2改为4历史
+  horizon: 8
+  n_obs_steps: 2
   
   # 任务列表 (需匹配已提取的特征)
   tasks: 

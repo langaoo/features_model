@@ -97,72 +97,41 @@ class MultiGPUFeatureExtractors:
             croco_model, model_gpu_map['croco'], 'croco', output_dim=1024
         )
         
-        # 2. DINOv3
+        # 2. DINOv3 (复用离线导出逻辑，保证权重映射一致)
         print(f"[MultiGPU] 加载 DINOv3 到 GPU {model_gpu_map['dinov3']}...")
-        # 为了 import dinov3.models.vision_transformer，需要把 dinov3 外层目录加到 path
-        # 这样 import dinov3 就会找到 dinov3/dinov3 目录
         dinov3_outer_path = os.path.join(cwd, 'dinov3')
         if dinov3_outer_path not in sys.path:
             sys.path.insert(0, dinov3_outer_path)
 
         dinov3_dir = os.path.join(cwd, 'dinov3/weight/B16')  # 绝对路径
-        
-        import os as _os
-        _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-        _os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        
-        import json
-        from safetensors.torch import load_file
-        # 指向 dinov3/dinov3/models/vision_transformer.py
-        from dinov3.models.vision_transformer import DinoVisionTransformer
-        
-        config_path = os.path.join(dinov3_dir, "config.json")
-        with open(config_path, "r") as f:
-            cfg = json.load(f)
-        
-        patch_size = int(cfg.get("patch_size", 16))
-        image_size = int(cfg.get("image_size", 224))
-        embed_dim = int(cfg.get("hidden_size", 768))
-        depth = int(cfg.get("num_hidden_layers", 12))
-        num_heads = int(cfg.get("num_attention_heads", 12))
-        
-        dinov3_model = DinoVisionTransformer(
-            img_size=image_size,
-            patch_size=patch_size,
-            embed_dim=embed_dim,
-            depth=depth,
-            num_heads=num_heads,
+
+        # 复用离线导出脚本的本地加载逻辑（包含qkv融合与rope buffer修复）
+        import importlib
+        load_local_hf_dinov3 = importlib.import_module(
+            "extract_multi_frame_dinov3_features_local"
+        ).load_local_hf_dinov3
+
+        dinov3_model, processor_cfg = load_local_hf_dinov3(
+            model_dir=dinov3_dir,
+            device=f'cuda:{model_gpu_map["dinov3"]}'
         )
-        
-        weights_path = os.path.join(dinov3_dir, "model.safetensors")
-        state_dict = load_file(weights_path)
-        
-        def convert_hf_to_dinov3(sd):
-            out = {}
-            for k, v in sd.items():
-                nk = k.replace("embeddings.cls_token", "cls_token")
-                nk = nk.replace("embeddings.mask_token", "mask_token")
-                nk = nk.replace("embeddings.patch_embeddings", "patch_embed")
-                nk = nk.replace("encoder.layer.", "blocks.")
-                nk = nk.replace(".attention.attention", ".attn")
-                nk = nk.replace(".intermediate.dense", ".mlp.fc1")
-                nk = nk.replace(".output.dense", ".mlp.fc2")
-                nk = nk.replace(".layernorm_before", ".norm1")
-                nk = nk.replace(".layernorm_after", ".norm2")
-                
-                # 修复mask_token维度: [1, 1, 768] -> [1, 768]
-                if nk == "mask_token" and len(v.shape) == 3:
-                    v = v.squeeze(1)
-                
-                out[nk] = v
-            return out
-        
-        state_dict = convert_hf_to_dinov3(state_dict)
-        dinov3_model.load_state_dict(state_dict, strict=False)
-        dinov3_model = dinov3_model.to(f'cuda:{model_gpu_map["dinov3"]}')
         dinov3_model.eval()
+
+        image_size = int(processor_cfg.get("size", {}).get("height", 224))
+        patch_size = int(processor_cfg.get("patch_size", 16))
+        image_mean = processor_cfg.get("image_mean", [0.485, 0.456, 0.406])
+        image_std = processor_cfg.get("image_std", [0.229, 0.224, 0.225])
+        dinov3_patch_tokens = (image_size // patch_size) ** 2
+
         self.extractors['dinov3'] = FeatureExtractorWrapper(
-            dinov3_model, model_gpu_map['dinov3'], 'dinov3', output_dim=1024
+            dinov3_model,
+            model_gpu_map['dinov3'],
+            'dinov3',
+            output_dim=768,
+            patch_tokens=dinov3_patch_tokens,
+            dinov3_image_size=image_size,
+            dinov3_image_mean=image_mean,
+            dinov3_image_std=image_std,
         )
         
         # 3. VGGT
@@ -179,7 +148,7 @@ class MultiGPUFeatureExtractors:
         vggt_model = vggt_model.to(f'cuda:{model_gpu_map["vggt"]}')
         vggt_model.eval()
         self.extractors['vggt'] = FeatureExtractorWrapper(
-            vggt_model, model_gpu_map['vggt'], 'vggt', output_dim=768
+            vggt_model, model_gpu_map['vggt'], 'vggt', output_dim=2048
         )
         
         # 4. Depth-Anything-V3
@@ -194,11 +163,26 @@ class MultiGPUFeatureExtractors:
         from depth_anything_3.api import DepthAnything3
         
         da3_model_dir = os.path.join(cwd, 'Depth-Anything-3/weight')  # 绝对路径
-        da3_model = DepthAnything3.from_pretrained(da3_model_dir)
-        da3_model = da3_model.to(f'cuda:{model_gpu_map["da3"]}')
-        da3_model.eval()
+        # 优先复用离线导出脚本的build_da3（保证权重加载一致）
+        try:
+            import importlib.util
+            da3_script = os.path.join(cwd, 'Depth-Anything-3', 'extract_multi_frame_depthanything3_features.py')
+            spec = importlib.util.spec_from_file_location('da3_extract', da3_script)
+            da3_mod = importlib.util.module_from_spec(spec)
+            assert spec and spec.loader
+            spec.loader.exec_module(da3_mod)
+            da3_model = da3_mod.build_da3(da3_model_dir, device=torch.device(f'cuda:{model_gpu_map["da3"]}'))
+        except Exception:
+            da3_model = DepthAnything3.from_pretrained(da3_model_dir)
+            da3_model = da3_model.to(f'cuda:{model_gpu_map["da3"]}')
+            da3_model.eval()
         self.extractors['da3'] = FeatureExtractorWrapper(
-            da3_model, model_gpu_map['da3'], 'da3', output_dim=1024
+            da3_model,
+            model_gpu_map['da3'],
+            'da3',
+            output_dim=2048,
+            da3_process_res=504,
+            da3_process_res_method='upper_bound_resize',
         )
         
         print("[MultiGPU] ✓ 所有模型加载完成")
@@ -258,13 +242,31 @@ class MultiGPUFeatureExtractors:
 
 class FeatureExtractorWrapper:
     """单个特征提取器的包装类"""
-    
-    def __init__(self, model: nn.Module, gpu_id: int, model_name: str, output_dim: int):
+
+    def __init__(
+        self,
+        model: nn.Module,
+        gpu_id: int,
+        model_name: str,
+        output_dim: int,
+        patch_tokens: int | None = None,
+        dinov3_image_size: int | None = None,
+        dinov3_image_mean: list[float] | None = None,
+        dinov3_image_std: list[float] | None = None,
+        da3_process_res: int | None = None,
+        da3_process_res_method: str | None = None,
+    ):
         self.model = model
         self.gpu_id = gpu_id
         self.model_name = model_name
         self.output_dim = output_dim
         self.device = f'cuda:{gpu_id}'
+        self.patch_tokens = patch_tokens
+        self.dinov3_image_size = dinov3_image_size
+        self.dinov3_image_mean = dinov3_image_mean
+        self.dinov3_image_std = dinov3_image_std
+        self.da3_process_res = da3_process_res
+        self.da3_process_res_method = da3_process_res_method or 'upper_bound_resize'
     
     def __call__(self, image: Image.Image) -> np.ndarray:
         return self.extract_batch([image])[0]
@@ -286,8 +288,9 @@ class FeatureExtractorWrapper:
             # 预处理（根据模型类型）
             if self.model_name == 'croco':
                 from torchvision import transforms
+                from torchvision.transforms import InterpolationMode
                 transform = transforms.Compose([
-                    transforms.Resize((224, 224)),
+                    transforms.Resize((224, 224), interpolation=InterpolationMode.BICUBIC),
                     transforms.ToTensor(),
                     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
                 ])
@@ -301,16 +304,24 @@ class FeatureExtractorWrapper:
             
             elif self.model_name == 'dinov3':
                 from torchvision import transforms
+                image_size = self.dinov3_image_size or 224
+                image_mean = self.dinov3_image_mean or [0.485, 0.456, 0.406]
+                image_std = self.dinov3_image_std or [0.229, 0.224, 0.225]
                 transform = transforms.Compose([
-                    transforms.Resize((224, 224)),
+                    transforms.Resize((image_size, image_size)),
                     transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                    transforms.Normalize(mean=image_mean, std=image_std),
                 ])
-                img_tensors = torch.stack([transform(img) for img in images]).to(self.device) # [B, 3, 224, 224]
+                img_tensors = torch.stack([transform(img) for img in images]).to(self.device)
                 
-                # DINOv3 批量推理
-                feat = self.model(img_tensors)  # [B, 1024]
-                feat = feat.cpu().numpy() # [B, 1024]
+                # DINOv3 批量推理（对齐离线导出逻辑）
+                if hasattr(self.model, "get_intermediate_layers"):
+                    y = self.model.get_intermediate_layers(img_tensors, n=1)[0]
+                else:
+                    y = self.model(img_tensors)
+                patch_tokens = self.patch_tokens or (y.shape[1] - 1)
+                y = y[:, -patch_tokens:, :]
+                feat = y.mean(dim=1).cpu().numpy()  # [B, 1024]
             
             elif self.model_name == 'vggt':
                 from torchvision import transforms
@@ -333,7 +344,12 @@ class FeatureExtractorWrapper:
                     
                     # 使用aggregator提取特征
                     # output: [List of [B, T, N, C], patch_start_idx]
-                    aggregated_tokens_list, patch_start_idx = self.model.aggregator(imgs)
+                    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+                        amp_dtype = torch.bfloat16
+                    else:
+                        amp_dtype = torch.float16
+                    with torch.cuda.amp.autocast(dtype=amp_dtype):
+                        aggregated_tokens_list, patch_start_idx = self.model.aggregator(imgs)
                     last_tokens = aggregated_tokens_list[-1]  # [B, 1, N, C]
                     patch_tokens = last_tokens[:, :, patch_start_idx:, :]  # [B, 1, Np, C]
                     
@@ -359,8 +375,8 @@ class FeatureExtractorWrapper:
                         paths,
                         extrinsics=None,
                         intrinsics=None,
-                        process_res=518,
-                        process_res_method='lower_bound_resize',
+                        process_res=self.da3_process_res or 504,
+                        process_res_method=self.da3_process_res_method,
                     )
                     imgs, _, _ = self.model._prepare_model_inputs(imgs_cpu, None, None)
                     if isinstance(imgs, (list, tuple)):
@@ -378,7 +394,7 @@ class FeatureExtractorWrapper:
 
                     imgs = imgs.to(self.device)
                     backbone = self.model.model.backbone
-                    feats, _ = backbone(x=imgs, export_feat_layers=[-1])
+                    feats, _ = backbone(x=imgs, export_feat_layers=[23])
                     if not feats:
                         raise RuntimeError("backbone返回空特征")
                     tokens, _ = feats[0]
@@ -414,6 +430,14 @@ class FeatureExtractorWrapper:
             else:
                 raise ValueError(f"Unknown model: {self.model_name}")
         
+        # 将特征调整到目标维度（如 VGGT/DA3 强制 2048），再 pad 到 2048
+        if feat.shape[1] != self.output_dim:
+            feat_t = torch.from_numpy(feat).to(self.device)
+            feat_t = torch.nn.functional.adaptive_avg_pool1d(
+                feat_t.unsqueeze(1), self.output_dim
+            ).squeeze(1)
+            feat = feat_t.detach().cpu().numpy()
+
         # 批量 Pad 到 2048 维
         batch_feats = []
         for f in feat:

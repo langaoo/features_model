@@ -21,7 +21,7 @@ python tools/features/run_extract_features.py \
 │  └─ 输出: pc_dataset/PC_ORI, rgb_dataset/RGB_ORI            │
 │                                                              │
 │  步骤2: RGB特征提取 (run_extract_features.py)               │
-│  ├─ RGB → 4模型特征 [B,4,2048]                              │
+│  ├─ RGB → 4模型特征 [W, T, Hf, Wf, C_i]                     │
 │  └─ 输出: features_croco/vggt/dinov3/da3_zarr               │
 │                                                              │
 ```bash
@@ -29,7 +29,7 @@ cd /home/gl/RoboTwin/policy/DP2DP3/features_model
 python tools/features/run_extract_features.py \
     --model dinov3 --window_size 8 --stride 1 --device cuda
 ```
-│  ├─ RGB[4,2048] → 对齐模块 → [1280]                         │
+│  ├─ RGB token[K] → 对齐模块 → [1280]                        │
 │  ├─ 监督: MSE + InfoNCE with 点云[1280]                     │
 │  └─ 输出: ckpt_final.pt (对齐模块权重)                      │
 │                                                              │
@@ -207,7 +207,13 @@ features_model/pc_dataset/ulip_features_zarr/
 
 **网络结构**:
 ```
-RGB多模态特征 [B, 4, 2048]
+RGB多模态特征（原始token）[B, 4, K, C_i]
+    # C_i ∈ {1024, 2048, 768, 2048}，来自 CroCo/VGGT/DINOv3/DA3
+    # 这些token来自Zarr: [W, T, Hf, Wf, C_i]
+    # K = 每个样本从单帧(或window)中随机采样的token数量（K≪Hf×Wf）
+    # 训练时不直接堆叠为[B,4,W,T,Hf,Wf,C]，而是先随机采样出K个token再组成batch
+    ↓
+（可选）token池化 → RGB多模态特征（向量）[B, 4, C_i]
     ↓
 4个Adapter MLP (统一维度)
     ├─ croco: 1024 → 1280
@@ -219,7 +225,7 @@ Weighted Fusion (可学习权重)
     ↓
 [B, 1280] 融合特征
     ↓
-Transformer Context Encoder (2层)
+Transformer Context Encoder (2层，可选)
     ↓
 Projection MLP
     ↓
@@ -249,10 +255,13 @@ python tools/alignment/train_rgb2pc_distill.py \
 ```yaml
 tasks: [5个任务]               # 多任务泛化
 batch_size: 32                  # InfoNCE需要大batch
-steps: 10000                    # 约7小时@单GPU
+steps: 20000                    # 约14小时@单GPU
 lr: 0.0003                      # 学习率
 tau: 0.07                       # InfoNCE温度
 loss_mse: 1.0                   # MSE权重 (关键修复!)
+loss_rgb: 0.1                   # RGB自对比权重，保留视觉语义
+rgb_tau: 0.07                   # RGB自对比温度
+student_pool: mean              # 与推理一致的池化方式
 ```
 
 **输出checkpoint**:
@@ -458,6 +467,9 @@ bash policy/DP2DP3/eval_direct_fusion.sh \
 eval_direct_fusion.sh <task> <train_setting> <eval_setting> <num_demos> <seed> <gpu_id> <checkpoint_num>
 ```
 
+**多GPU说明**:
+- `gpu_id` 支持传入逗号分隔的 GPU 列表，例如 `"0,1"`。
+
 ### 与对齐方案对比
 
 | 特性 | 对齐方案 (步骤4) | 直接融合 (步骤4B) |
@@ -550,6 +562,42 @@ fusion:
 
 ---
 
+### 单帧（window_size=1）流程与数据形状说明
+
+以下按常见配置（`window_size=1`, `horizon=8`, `n_obs_steps=2`, `action_exec=4`）说明：
+
+1) 原始观测
+- 每步 RGB 图像: `[H, W, 3]`（例如 480×640×3）
+
+2) RGB 特征提取（window_size=1）
+- Zarr 中保存的特征：`[W, T, Hf, Wf, C_i]`
+- 当 `window_size=1` 时 `T=1`，因此形状实际是：`[W, 1, Hf, Wf, C_i]`
+- `W≈总帧数`（window_size=1, stride=1 时每帧一个窗口）
+
+3) 对齐训练采样（step 粒度）
+- 从单帧中采样 `K` 个 patch token：每模型 `[K, C_i]`
+- 多模型堆叠：`[B, 4, K, C_i]`
+- 若 `student_pool=mean`，池化后：`[B, 4, C_i]`
+- Adapter → 融合 → 投影后：`[B, 1280]`
+- 当前 `student_pool=tokens` 表示训练时保留 token 级上下文并做 attention pooling
+
+4) 离线特征生成（用于 head）
+- 推理/离线特征提取时只提供每帧 pooled 向量
+- MultiGPU extractor 输出：`[To, 4, 2048]`（每帧 4 模型向量）
+- 对齐 encoder 输出：`[To, 1280]`
+- 整个 episode：`obs_aligned: [T, 1280]`，`action: [T, 14]`
+
+5) Head 训练输入输出
+- `n_obs_steps=2`：取最近 2 帧对齐特征
+- 输入形状：`[B, 2, 1280]`
+- `horizon=8`：预测未来 8 步动作
+- 输出形状：`[B, 8, 14]`
+
+6) 推理执行（Receding Horizon）
+- 模型输出：`[8, 14]`
+- `action_exec=4`：只执行前 4 步，再重新规划
+- 好处：减少抖动，同时保持响应性
+
 ## 步骤5: 动作头训练
 
 ### 说明
@@ -601,9 +649,9 @@ python tools/online/train_online_from_config.py \
 **关键参数**:
 ```yaml
 data:
-  horizon: 4          # 预测4步 (修复: 从8→4)
-  n_obs_steps: 4      # 观测4帧 (修复: 从2→4)
-  batch_size: 8       # 批量提取模式
+    horizon: 8
+    n_obs_steps: 2
+    batch_size: 8       # 批量提取模式
   
 policy:
   type: OfficialDP    # 使用正版Diffusion Policy
@@ -674,15 +722,15 @@ data/offline_features/
     ↓
 RGB图像 [3, H, W]
     ↓
-观测缓冲区 deque(maxlen=4)
+观测缓冲区 deque(maxlen=2)
     ↓ (每次推理)
-4帧图像 batch
+2帧图像 batch
     ↓ (4个视觉模型)
-特征 [4, 4, 2048]
+特征 [2, 4, 2048]
     ↓ (对齐模块)
-对齐特征 [1, 4, 1280]
+对齐特征 [1, 2, 1280]
     ↓ (Diffusion Head)
-动作序列 [1, 4, 14]
+动作序列 [1, 8, 14]
     ↓ (Receding Horizon: 只执行前2步)
 执行动作 [14]
     ↓
@@ -691,8 +739,8 @@ RGB图像 [3, H, W]
 
 **Receding Horizon策略**:
 ```python
-# 预测4步
-actions = policy.predict()  # [4, 14]
+# 预测8步
+actions = policy.predict()  # [8, 14]
 
 # 只执行前2步
 for i in range(2):
@@ -708,6 +756,19 @@ cd /home/gl/RoboTwin
 bash policy/DP2DP3/eval.sh beat_block_hammer demo_randomized demo_randomized 20 0 1 3000  
 ```
 
+**环境说明**:
+- 训练环境使用 `depth3`（训练依赖更完整）
+- 推理评估使用 `RoboTwin`（包含 `mplib` 依赖）
+
+**多GPU评估示例**:
+```bash
+# 对齐DP2DP3（多GPU）
+bash policy/DP2DP3/eval.sh lift_pot demo_clean demo_clean 50 0 "0,1" 600 4 100
+
+# 直接融合（多GPU）
+bash policy/DP2DP3/eval_direct_fusion.sh lift_pot demo_clean demo_clean 50 0 "0,1" 600 4 100
+```
+
 ---
 
 ## 关键文件说明
@@ -720,14 +781,15 @@ bash policy/DP2DP3/eval.sh beat_block_hammer demo_randomized demo_randomized 20 
 tasks: [5个任务列表]
 batch_size: 32
 loss_mse: 1.0        # ⭐必须>0，否则无法学到空间位置
+loss_rgb: 0.1        # RGB自对比，保留视觉语义
 tau: 0.07            # InfoNCE温度
 ```
 
 2. **在线训练配置**: `configs/head/train_online_batch_extract.yaml`
 ```yaml
 data:
-  horizon: 4         # ⭐修复: 从8改为4
-  n_obs_steps: 4     # ⭐修复: 从2改为4
+    horizon: 8
+    n_obs_steps: 2
   batch_extract: true  # 批量提取加速
 ```
 
@@ -735,8 +797,8 @@ data:
 ```yaml
 data:
   features_dataset_dir: data/offline_features
-  horizon: 4
-  n_obs_steps: 4
+    horizon: 8
+    n_obs_steps: 2
 train:
   batch_size: 256    # 离线模式可以用大batch
   epochs: 3000
@@ -883,6 +945,56 @@ K越大 → 轨迹越平滑，但响应性越差
 K越小 → 响应性越好，但轨迹越不连续
 推荐: K=H/2 (本例中K=4, H=8)
 ```
+
+---
+
+### 问题2B: 对齐路线成功率过低（新增排查）
+
+**现象**：对齐模型推理成功率接近 0，远低于单模型/四模型融合。
+
+**根本原因之一**：离线特征提取与Head训练的时间参数不一致。
+- `extract_offline_features.py` 使用 `train_online_batch_extract_ws1.yaml`（horizon=8, n_obs_steps=2）
+- 但 `train_offline_ws1.yaml` 仍是其它配置（例如 4/4）
+- 这会导致观测窗口与动作标签错位，模型学到的时序关系无效
+
+**修复方案**：确保离线Head训练参数与特征提取一致。
+```yaml
+# configs/head/train_offline_ws1.yaml
+data:
+    horizon: 8
+    n_obs_steps: 2
+```
+
+**建议补充**：
+1. 将对齐训练 steps 提升到 10k~20k（2k steps 往往不够收敛）。
+2. 保持 `loss_mse=1.0`，避免只有 InfoNCE 导致空间对齐不足。
+3. 加入 RGB 自对比损失，保留视觉语义。
+
+---
+
+### 问题2C: 8帧视觉窗口效果不佳
+
+**现象**：使用 window_size=8 的多帧特征时，抓取意图被“平均”掉，动作更犹豫。
+
+**原因**：
+1. 8帧窗口会把动作前的“过渡帧”一起平均，导致关键帧语义被稀释。
+2. 对齐训练是 step 粒度时，8帧窗口的时间聚合与推理的单帧缓冲不一致。
+
+**建议**：
+- 离线特征提取使用 ws1（window_size=1）或保持训练/推理同粒度。
+- 如果必须用 8 帧窗口，训练时也要用 window 模式并在推理时保持一致的时间聚合。
+
+---
+
+### 问题2D: DINOv3 QKV特征误用
+
+**现象**：单模型 DINOv3 成功率异常低，表现为动作漂移或无明显目标趋近。
+
+**原因**：早期提取误用注意力层的 QKV 中间张量或未正确池化，导致特征尺度不稳定、语义不聚合。
+
+**修复**：
+- 仅使用 DINOv3 最终 patch token 输出，并进行均值池化。
+- 确保特征与其它模型保持相同的归一化流程。
 
 ---
 
@@ -1140,8 +1252,8 @@ bash policy/DP2DP3/eval.sh beat_block_hammer demo_randomized demo_randomized 20 
 
 **关键修复点**:
 1. ✅ `loss_mse: 1.0` - 确保数值对齐
-2. ✅ `horizon: 4` - 减少误差累积  
-3. ✅ `n_obs_steps: 4` - 增加历史信息
+2. ✅ `horizon: 8`
+3. ✅ `n_obs_steps: 2`
 4. ✅ Receding Horizon - 只执行2步再重新预测
 5. ✅ 动作clip - 限制在关节范围内
 
@@ -1821,6 +1933,11 @@ cd /home/gl/RoboTwin/policy/DP2DP3
 
 # 评估单模型
 bash eval_single_model.sh lift_pot demo_clean demo_clean 50 0 1 best dinov3
+```
+
+**参数说明**:
+```bash
+eval_single_model.sh <task> <train_setting> <eval_setting> <num_demos> <seed> <gpu_id> <checkpoint> <model_name>
 ```
 
 ### 文件结构

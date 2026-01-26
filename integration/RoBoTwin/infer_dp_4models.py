@@ -23,14 +23,14 @@ import sys
 from pathlib import Path
 
 # Add features_model to path
-FEATURES_ROOT = Path(__file__).resolve().parents[2]  # /home/gl/features_model
+FEATURES_ROOT = Path(__file__).resolve().parents[2]  # /home/gl/RoboTwin/policy/DP2DP3/features_model
 sys.path.insert(0, str(FEATURES_ROOT))
 sys.path.insert(0, str(FEATURES_ROOT / "DP" / "diffusion_policy"))
 
 import torch
 import numpy as np
 
-from features_common.rgb2pc_aligned_encoder_4models import RGB2PCAlignedEncoder4Models
+from features_common.alignment.rgb2pc_aligned_encoder_4models import RGB2PCAlignedEncoder4Models
 from features_common.dp_rgb_policy_single import HeadSpec, DiffusionRGBHead
 from features_common.zarr_pack import load_zarr_pack
 

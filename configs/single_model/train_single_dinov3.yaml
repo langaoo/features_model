@@ -10,7 +10,7 @@ data:
   expert_data_num: 50
   
   # 使用单个模型的zarr特征 (选择DINOv3测试)
-  vis_zarr_root: /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_dinov3_encoder_dict_unified_zarr
+  vis_zarr_root: /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_dinov3_encoder_dict_unified_zarr
   
   # 数据采样
   horizon: 8
@@ -26,7 +26,7 @@ policy:
 
 # 训练配置
 train:
-  epochs: 1000
+  epochs: 600
   batch_size: 32
   lr: 0.0001
   weight_decay: 0.000001
@@ -38,5 +38,5 @@ device:
 
 # Checkpoint配置
 checkpoint:
-  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_single_model/lift_pot-demo_clean-50-dinov3
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_single_model_ws1/lift_pot-demo_clean-50-vggt
   save_every: 50

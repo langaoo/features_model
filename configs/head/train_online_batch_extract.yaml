@@ -16,9 +16,9 @@ data:
   tasks: 
     - lift_pot
   
-  # 数据采样 - 🔧 修复：缩短 horizon，增加观测窗口
-  horizon: 4          # 从8改为4：减少Open-loop误差累积（80ms vs 160ms）
-  n_obs_steps: 4      # 从2改为4：增加历史信息，捕捉动态
+  # 数据采样 - 与直融/单模型保持一致
+  horizon: 8
+  n_obs_steps: 2
   
   # 双臂配置
   use_left_arm: true

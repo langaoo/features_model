@@ -27,7 +27,7 @@ if robotwin_path.exists():
 else:
     print(f"[WARNING] RoBoTwin路径不存在: {robotwin_path}")
 
-from features_common.rgb2pc_aligned_encoder_4models import RGB2PCAlignedEncoder4Models
+from features_common.alignment.rgb2pc_aligned_encoder_4models import RGB2PCAlignedEncoder4Models
 from features_common.multi_gpu_extractors import MultiGPUFeatureExtractors
 
 # 检查sapien依赖

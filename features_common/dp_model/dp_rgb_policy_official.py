@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 
 # 添加正版DP路径
-DP_ROOT = Path("/home/gl/features_model/DP/diffusion_policy")
+DP_ROOT = Path("/home/gl/RoboTwin/policy/DP2DP3/features_model/DP/diffusion_policy")
 sys.path.insert(0, str(DP_ROOT))
 
 from diffusion_policy.policy.diffusion_unet_lowdim_policy import DiffusionUnetLowdimPolicy

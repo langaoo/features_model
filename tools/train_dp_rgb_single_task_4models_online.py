@@ -38,7 +38,7 @@ from features_common.dp_rgb_dataset_online_4models import (
     collate_fn_online_4,
 )
 from features_common.online_extractors import load_all_extractors
-from features_common.rgb2pc_aligned_encoder_4models import RGB2PCAlignedEncoder4Models
+from features_common.alignment.rgb2pc_aligned_encoder_4models import RGB2PCAlignedEncoder4Models
 
 # Import DP Head (假设你有 DiffusionRGBHead 实现)
 try:

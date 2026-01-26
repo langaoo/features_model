@@ -1,0 +1,58 @@
+# ===========================
+# 直接融合训练配置 (离线版 ✔️ 无对齐模块 无在线特征提取)
+# ===========================
+# 目的: 测试是否是对齐模块破坏了特征
+# 核心优化: 加载预提取的4模型zarr特征，彻底解决大模型前向慢问题
+# 训练目标: 仅训练融合权重 + DP Head，特征提取器完全冻结
+
+# 数据路径
+data:
+  robotwin_data_root: /home/gl/RoboTwin/data
+  task_config: demo_clean
+  camera_name: head_camera
+  
+  tasks: 
+    - lift_pot
+  
+  # 数据采样
+  horizon: 8
+  n_obs_steps: 2
+  
+  # 双臂配置
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: true
+  
+  # ✅ 核心新增: 你的4个模型离线zarr特征完整路径 (顺序严格对应: croco→vggt→dinov3→da3)
+  vis_zarr_roots:
+    - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_croco_encoder_dict_unified_zarr
+    - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_vggt_encoder_dict_unified_zarr
+    - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_dinov3_encoder_dict_unified_zarr
+    - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_da3_encoder_dict_unified_zarr
+
+# 融合配置 (完全不变)
+fusion:
+  type: weighted  # 'weighted', 'concat', 'mean'
+  out_dim: 1280   # 融合后的特征维度
+
+# 策略网络 (完全不变)
+policy:
+  num_inference_steps: 100
+
+# 训练配置 (完全不变)
+train:
+  epochs: 600
+  batch_size: 32
+  lr: 0.0001
+  weight_decay: 0.000001
+
+# 设备配置 (完全不变)
+device:
+  gpu_ids: [0, 1]
+
+# Checkpoint配置 (完全不变)
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_direct_fusion_ws1/lift_pot-demo_clean-50-0
+  save_every: 100
+  expert_data_num: 50

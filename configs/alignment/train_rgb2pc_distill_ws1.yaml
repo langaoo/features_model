@@ -1,0 +1,67 @@
+# RGB2PC 对齐训练配置（ws1版，RGB特征=单帧）
+# 使用 ws1 的四模型离线特征，训练对齐模块（student->teacher）
+
+tasks:
+  - lift_pot-demo_clean-50_sapien_head_camera
+
+episodes: 0
+
+pc_root: /home/gl/RoboTwin/policy/DP2DP3/features_model/pc_dataset/ulip_features_zarr
+
+# ws1 视觉特征根目录（四模型）
+vis_zarr_roots:
+  - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_croco_encoder_dict_unified_zarr
+  - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_vggt_encoder_dict_unified_zarr
+  - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_dinov3_encoder_dict_unified_zarr
+  - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_da3_encoder_dict_unified_zarr
+
+# 训练
+device: cuda
+amp: true
+steps: 10000
+batch_size: 16
+grad_accum_steps: 1
+lr: 0.0003
+seed: 0
+tau: 0.07
+num_workers: 8
+
+# 蒸馏目标
+fuse_dim: 1280
+fusion: weighted
+moe_hidden: 1280
+loss_mse: 1.0
+loss_rgb: 0.1
+rgb_tau: 0.07
+
+# 采样
+sample_unit: step
+window_agg: mean
+student_tokens: 1024
+teacher_points: 1024
+student_pool: tokens
+token_pool: attn
+loss_local: 0.1
+local_tau: 0.07
+loss_pool: 0.1
+
+# 配对
+strict_pairing: true
+pairing_fallback: error
+
+# 性能/日志
+pack_cache_size: 4
+log_every: 50
+mem_every: 0
+
+tqdm: true
+
+# wandb
+wandb: false
+wandb_project: rgb2pc_distill
+wandb_entity: ""
+wandb_run_name: ""
+
+# ckpt
+save_dir: /home/gl/RoboTwin/policy/DP2DP3/features_model/outputs/train_rgb2pc_runs/run_ws1
+save_every: 500

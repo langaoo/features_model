@@ -7,12 +7,12 @@
 用法（示例）：
   conda run -n DP3_ULIP python tools/train_dp_rgb_single_task_4models.py \
     --task beat_block_hammer-demo_randomized-20_head_camera \
-    --croco_root /home/gl/features_model/rgb_dataset/features_croco_encoder_dict_unified_zarr \
-    --vggt_root  /home/gl/features_model/rgb_dataset/features_vggt_encoder_dict_unified_zarr \
-    --dino_root  /home/gl/features_model/rgb_dataset/features_dinov3_encoder_dict_unified_zarr \
-    --da3_root   /home/gl/features_model/rgb_dataset/features_da3_encoder_dict_unified_zarr \
-    --traj_root /home/gl/features_model/raw_data \
-    --rgb2pc_ckpt /home/gl/features_model/outputs/train_rgb2pc_runs/run_best_bs32/ckpt_step_0010000.pt \
+    --croco_root /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_croco_encoder_dict_unified_zarr \
+    --vggt_root  /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_vggt_encoder_dict_unified_zarr \
+    --dino_root  /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_dinov3_encoder_dict_unified_zarr \
+    --da3_root   /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_da3_encoder_dict_unified_zarr \
+    --traj_root /home/gl/RoboTwin/policy/DP2DP3/features_model/raw_data \
+    --rgb2pc_ckpt /home/gl/RoboTwin/policy/DP2DP3/features_model/outputs/train_rgb2pc_runs/run_best_bs32/ckpt_step_0010000.pt \
     --save_dir outputs/dp_rgb_runs/beat_block_hammer_4models
 
 产物：
@@ -43,7 +43,7 @@ from diffusion_policy.model.common.normalizer import LinearNormalizer
 from diffusion_policy.model.common.normalizer import SingleFieldLinearNormalizer
 
 from features_common.dp_rgb_dataset_4models import DPRGB4ModelDataset, collate_fn_4
-from features_common.rgb2pc_aligned_encoder_4models import RGB2PCAlignedEncoder4Models
+from features_common.alignment.rgb2pc_aligned_encoder_4models import RGB2PCAlignedEncoder4Models
 from features_common.dp_rgb_policy_multitask import DiffusionRGBHead, HeadSpec  # reuse head implementation
 
 
@@ -76,15 +76,15 @@ def main():
     
     # 特征路径（提供默认值）
     ap.add_argument('--croco_root', type=str, 
-                    default='/home/gl/features_model/rgb_dataset/features_croco_encoder_dict_unified_zarr')
+                    default='/home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_croco_encoder_dict_unified_zarr')
     ap.add_argument('--vggt_root', type=str,
-                    default='/home/gl/features_model/rgb_dataset/features_vggt_encoder_dict_unified_zarr')
+                    default='/home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_vggt_encoder_dict_unified_zarr')
     ap.add_argument('--dino_root', type=str,
-                    default='/home/gl/features_model/rgb_dataset/features_dinov3_encoder_dict_unified_zarr')
+                    default='/home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_dinov3_encoder_dict_unified_zarr')
     ap.add_argument('--da3_root', type=str,
-                    default='/home/gl/features_model/rgb_dataset/features_da3_encoder_dict_unified_zarr')
+                    default='/home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/features_da3_encoder_dict_unified_zarr')
     ap.add_argument('--traj_root', type=str,
-                    default='/home/gl/features_model/raw_data')
+                    default='/home/gl/RoboTwin/policy/DP2DP3/features_model/raw_data')
     
     # encoder checkpoint（支持两个参数名）
     ap.add_argument('--rgb2pc_ckpt', '--encoder_ckpt', type=str, required=True,

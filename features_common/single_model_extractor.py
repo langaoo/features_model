@@ -73,21 +73,60 @@ class SingleModelFeatureExtractor:
     
     def _load_vggt(self, cwd):
         """加载VGGT"""
-        from transformers import AutoImageProcessor, AutoModel
-        vggt_ckpt = "Idiot-Scientist/VGGT"
-        self.processor = AutoImageProcessor.from_pretrained(vggt_ckpt)
-        self.model = AutoModel.from_pretrained(vggt_ckpt, torch_dtype=torch.bfloat16).to(self.device)
-        self.model.eval()
+        # 优先使用本地权重（与离线导出一致）
+        vggt_outer = os.path.join(cwd, 'vggt')
+        if vggt_outer not in sys.path:
+            sys.path.insert(0, vggt_outer)
+
+        weight_path = os.path.join(cwd, 'vggt/weight/model.pt')
+        if os.path.exists(weight_path):
+            from vggt.models.vggt import VGGT
+            self.model = VGGT()
+            state_dict = torch.load(weight_path, map_location='cpu')
+            self.model.load_state_dict(state_dict)
+            self.model = self.model.to(self.device)
+            self.model.eval()
+            self.processor = None
+        else:
+            from transformers import AutoImageProcessor, AutoModel
+            vggt_ckpt = "Idiot-Scientist/VGGT"
+            self.processor = AutoImageProcessor.from_pretrained(vggt_ckpt)
+            self.model = AutoModel.from_pretrained(vggt_ckpt, torch_dtype=torch.bfloat16).to(self.device)
+            self.model.eval()
     
     def _load_dinov3(self, cwd):
         """加载本地DINOv3 ViT-B/16 (768 dim) - 使用原生DinoVisionTransformer"""
+        dinov3_dir = os.path.join(cwd, 'dinov3/weight/B16')
         # 添加dinov3外层目录到path
         dinov3_outer_path = os.path.join(cwd, 'dinov3')
         if dinov3_outer_path not in sys.path:
             sys.path.insert(0, dinov3_outer_path)
         
-        dinov3_dir = os.path.join(cwd, 'dinov3/weight/B16')
-        print(f"[SingleModel] Loading DINOv3 from local path: {dinov3_dir}")
+        # 优先复用离线导出脚本的加载逻辑
+        try:
+            from extract_multi_frame_dinov3_features_local import load_local_hf_dinov3
+            model, processor_cfg = load_local_hf_dinov3(model_dir=dinov3_dir, device=str(self.device))
+            self.model = model
+            self.model.eval()
+            self.dinov3_mode = "offline"
+            image_size = int(processor_cfg.get("size", {}).get("height", 224))
+            patch_size = int(processor_cfg.get("patch_size", 16))
+            image_mean = processor_cfg.get("image_mean", [0.485, 0.456, 0.406])
+            image_std = processor_cfg.get("image_std", [0.229, 0.224, 0.225])
+            self.dinov3_image_size = image_size
+            self.dinov3_patch_size = patch_size
+            import torchvision.transforms as T
+            self.dinov3_transform = T.Compose([
+                T.Resize((image_size, image_size), interpolation=T.InterpolationMode.BICUBIC),
+                T.ToTensor(),
+                T.Normalize(mean=image_mean, std=image_std),
+            ])
+            return
+        except Exception as e:
+            print(f"[SingleModel] Offline DINOv3 loader failed, fallback to custom: {e}")
+            self.dinov3_mode = "custom"
+
+        print(f"[SingleModel] Loading DINOv3 from local path (custom): {dinov3_dir}")
         
         # 设置离线模式
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -116,6 +155,8 @@ class SingleModelFeatureExtractor:
             depth=depth,
             num_heads=num_heads,
         )
+        self.dinov3_patch_size = patch_size
+        self.dinov3_image_size = image_size
         
         # 加载权重
         weights_path = os.path.join(dinov3_dir, "model.safetensors")
@@ -227,6 +268,7 @@ class SingleModelFeatureExtractor:
         
         self.model = self.model.to(self.device)
         self.model.eval()
+        self.dinov3_mode = "custom"
         
         # 创建transform
         import torchvision.transforms as T
@@ -237,22 +279,33 @@ class SingleModelFeatureExtractor:
         ])
     
     def _load_da3(self, cwd):
-        """加载Depth-Anything v2"""
-        depth_anything_path = os.path.join(cwd, 'Depth-Anything-V2')
-        if depth_anything_path not in sys.path:
-            sys.path.insert(0, depth_anything_path)
-        
-        from depth_anything_v2.dpt import DepthAnythingV2
-        
-        model_configs = {
-            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]}
-        }
-        
-        self.model = DepthAnythingV2(**model_configs['vitl'])
-        ckpt_path = os.path.join(cwd, 'Depth-Anything-V2/checkpoints/depth_anything_v2_vitl.pth')
-        self.model.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
-        self.model = self.model.to(self.device)
-        self.model.eval()
+        """加载Depth-Anything-3（与离线特征一致）"""
+        da3_path = os.path.join(cwd, 'Depth-Anything-3/src')
+        if da3_path not in sys.path:
+            sys.path.insert(0, da3_path)
+
+        import os as _os
+        _os.environ.setdefault("DA3_LOG_LEVEL", "ERROR")
+
+        from depth_anything_3.api import DepthAnything3
+
+        da3_model_dir = os.path.join(cwd, 'Depth-Anything-3/weight')
+        # 优先复用离线导出脚本的build_da3（保证权重加载一致）
+        try:
+            import importlib.util
+            da3_script = os.path.join(cwd, 'Depth-Anything-3', 'extract_multi_frame_depthanything3_features.py')
+            spec = importlib.util.spec_from_file_location('da3_extract', da3_script)
+            da3_mod = importlib.util.module_from_spec(spec)
+            assert spec and spec.loader
+            spec.loader.exec_module(da3_mod)
+            self.model = da3_mod.build_da3(da3_model_dir, device=self.device)
+        except Exception:
+            self.model = DepthAnything3.from_pretrained(da3_model_dir)
+            self.model = self.model.to(self.device)
+            self.model.eval()
+        # 与离线导出脚本保持一致
+        self.da3_process_res = 504
+        self.da3_process_res_method = 'upper_bound_resize'
     
     def extract_batch(self, images: List[Image.Image]) -> np.ndarray:
         """
@@ -275,19 +328,46 @@ class SingleModelFeatureExtractor:
     def _extract_croco(self, images):
         """CroCo特征提取"""
         import torchvision.transforms as T
+        from torchvision.transforms import InterpolationMode
         transform = T.Compose([
-            T.Resize((224, 224)),
+            T.Resize((224, 224), interpolation=InterpolationMode.BICUBIC),
             T.ToTensor(),
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         
         imgs_tensor = torch.stack([transform(img) for img in images]).to(self.device)
-        out = self.model._encode_image(imgs_tensor, do_mask=False, do_aggregate=False)
-        feats = out[:, 0]  # CLS token [B, 1024]
+        out = self.model._encode_image(imgs_tensor, do_mask=False)[0]
+        feats = out.mean(dim=1)  # mean pool [B, 1024]
         return feats.cpu().numpy()
     
     def _extract_vggt(self, images):
         """VGGT特征提取"""
+        if self.processor is None:
+            from vggt.utils.load_fn import load_and_preprocess_images
+            import tempfile
+            import os as _os
+
+            temp_paths = []
+            try:
+                for img in images:
+                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+                        temp_paths.append(f.name)
+                        img.save(f.name)
+
+                imgs = load_and_preprocess_images(temp_paths)
+                imgs = imgs.unsqueeze(1).to(self.device)  # [B, 1, 3, 518, 518]
+                amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
+                with torch.no_grad(), torch.cuda.amp.autocast(dtype=amp_dtype):
+                    aggregated_tokens_list, patch_start_idx = self.model.aggregator(imgs)
+                last_tokens = aggregated_tokens_list[-1]  # [B, 1, N, C]
+                patch_tokens = last_tokens[:, :, patch_start_idx:, :]
+                feat = patch_tokens.mean(dim=[1, 2])
+                return feat.detach().cpu().float().numpy()
+            finally:
+                for p in temp_paths:
+                    if _os.path.exists(p):
+                        _os.unlink(p)
+
         inputs = self.processor(images=images, return_tensors="pt", do_rescale=True).to(self.device)
         out = self.model(**inputs)
         feats = out.last_hidden_state[:, 0]  # [B, 2048]
@@ -295,37 +375,77 @@ class SingleModelFeatureExtractor:
     
     def _extract_dinov3(self, images):
         """DINOv3特征提取 - 使用patch tokens全局平均池化（与训练时一致）"""
-        # 使用手动transform预处理
+        if getattr(self, "dinov3_mode", "custom") == "hf" and self.processor is not None:
+            inputs = self.processor(images=images, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+            # 使用patch tokens均值（去掉CLS）
+            patch_tokens = outputs.last_hidden_state[:, 1:, :]
+            feats = patch_tokens.mean(dim=1)
+            return feats.cpu().float().numpy()
+
+        # custom fallback: 对齐离线导出逻辑
         imgs_tensor = torch.stack([self.dinov3_transform(img) for img in images]).to(self.device)
-        
-        with torch.no_grad():
-            # DinoVisionTransformer的forward返回特征字典
-            outputs = self.model.forward_features(imgs_tensor)
-            # ⚠️ 关键修复：训练时用的是patch tokens的全局平均池化，不是CLS token！
-            # 离线特征: [T, 8, 14, 14, 768] -> mean(axis=(1,2,3)) -> [T, 768]
-            # 在线特征: 应该也用patch tokens平均，不是CLS token
-            patch_tokens = outputs['x_norm_patchtokens']  # [B, 196, 768] (14x14=196)
-            # 全局平均池化
-            feats = patch_tokens.mean(dim=1)  # [B, 768]
-        
+        hfwf = (int(self.dinov3_image_size) // int(self.dinov3_patch_size)) ** 2
+        amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
+        with torch.no_grad(), torch.amp.autocast(device_type="cuda" if self.device.type == "cuda" else "cpu", dtype=amp_dtype):
+            if hasattr(self.model, "get_intermediate_layers"):
+                y = self.model.get_intermediate_layers(imgs_tensor, n=1)[0]
+            else:
+                y = self.model(imgs_tensor)
+            # 去掉CLS/寄存器，只保留最后Hf*Wf patch tokens
+            patch_tokens = y[:, -hfwf:, :]
+            feats = patch_tokens.mean(dim=1)
         return feats.cpu().float().numpy()
     
     def _extract_da3(self, images):
-        """Depth-Anything v2特征提取"""
-        import torchvision.transforms as T
-        transform = T.Compose([
-            T.Resize((518, 518)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        
-        imgs_tensor = torch.stack([transform(img) for img in images]).to(self.device)
-        feats = self.model.forward_features(imgs_tensor)['x_prenorm'][:, 0]  # [B, 1024]
-        
-        # DA3输出1024d,需要投影到2048d
-        if not hasattr(self, 'da3_proj'):
-            self.da3_proj = nn.Linear(1024, 2048).to(self.device)
-            self.da3_proj.eval()
-        
-        feats = self.da3_proj(feats)  # [B, 2048]
-        return feats.cpu().numpy()
+        """Depth-Anything-3特征提取（与离线脚本一致）"""
+        import tempfile
+        import os as _os
+
+        def _da3_forward_from_paths(paths: list[str]) -> np.ndarray:
+            imgs_cpu, _, _ = self.model._preprocess_inputs(
+                paths,
+                extrinsics=None,
+                intrinsics=None,
+                process_res=self.da3_process_res,
+                process_res_method=self.da3_process_res_method,
+            )
+            imgs, _, _ = self.model._prepare_model_inputs(imgs_cpu, None, None)
+            if isinstance(imgs, (list, tuple)):
+                img_list = []
+                for x in imgs:
+                    if isinstance(x, torch.Tensor):
+                        if x.ndim == 3:
+                            x = x.unsqueeze(0)
+                        img_list.append(x)
+                if len(img_list) == 0:
+                    raise RuntimeError("DA3 _prepare_model_inputs returned empty list")
+                imgs = torch.cat(img_list, dim=0)
+            if not isinstance(imgs, torch.Tensor):
+                raise RuntimeError(f"DA3 _prepare_model_inputs returned unexpected type: {type(imgs)}")
+
+            imgs = imgs.to(self.device)
+            backbone = self.model.model.backbone
+            feats, _ = backbone(x=imgs, export_feat_layers=[23])
+            if not feats:
+                raise RuntimeError("backbone返回空特征")
+            tokens, _ = feats[0]
+            return tokens.mean(dim=[1, 2]).detach().cpu().numpy()
+
+        temp_paths = []
+        try:
+            for img in images:
+                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+                    temp_paths.append(f.name)
+                    img.save(f.name)
+
+            feat = _da3_forward_from_paths(temp_paths)
+            if feat.ndim == 1:
+                feat = feat[None, :]
+            return feat
+        finally:
+            for p in temp_paths:
+                if _os.path.exists(p):
+                    _os.unlink(p)

@@ -87,7 +87,8 @@ class DPRGBPolicy(nn.Module):
         device = obs.device
         
         # ✅ 使用normalizer归一化action (模仿RoboTwin原版DP)
-        nactions = self.normalizer['action'].normalize(action_gt)
+        # 归一化结果可能在CPU上，显式转到训练device
+        nactions = self.normalizer['action'].normalize(action_gt).to(device)
         
         obs_flat = obs.reshape(B, -1)
         obs_cond = self.obs_encoder(obs_flat)
@@ -322,7 +323,11 @@ def main():
             
             # checkpoints/{task}-{setting}-{num}-{seed}/{epoch}.ckpt
             save_dir_name = f"{task_name}-{ckpt_setting}-{num}-{seed}"
-            save_path = Path(__file__).parent.parent / "checkpoints" / save_dir_name
+            output_root = config.get('output', {}).get('dir')
+            if output_root:
+                save_path = Path(output_root) / save_dir_name
+            else:
+                save_path = Path(__file__).parent.parent / "checkpoints" / save_dir_name
             save_path.mkdir(parents=True, exist_ok=True)
             
             ckpt_file = save_path / f"{epoch+1}.ckpt"

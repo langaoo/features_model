@@ -97,7 +97,7 @@ from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1
 from diffusion_policy.model.diffusion.mask_generator import LowdimMaskGenerator
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 
-from features_common.rgb2pc_student_encoder import RGB2PCStudentEncoder
+from features_common.alignment.rgb2pc_student_encoder import RGB2PCStudentEncoder
 
 
 @dataclass
