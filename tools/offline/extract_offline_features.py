@@ -43,10 +43,13 @@ def extract_episode(
     camera_name: str,
     batch_size: int = 32,
     horizon: int = 4,
-    n_obs_steps: int = 4
+    n_obs_steps: int = 4,
+    use_token_infer: bool = False,
+    student_tokens: int = 64,
+    overwrite: bool = False,
 ):
     """处理单个episode"""
-    if output_path.exists():
+    if output_path.exists() and not overwrite:
         # print(f"Skipping {output_path} (exists)")
         return
     
@@ -104,19 +107,28 @@ def extract_episode(
                 img = Image.fromarray(img_np, mode='RGB')
             images.append(img)
             
-        # 提取 4 model 特征 [B, 4, 2048]
-        # extract_batch 内部会处理 batch
-        raw_feats = extractors.extract_batch(images)
-        
-        # 对齐 [B, 1280]
         with torch.no_grad():
             device = next(encoder.parameters()).device
-            # raw_feats: [B, 4, 2048] -> [B, 1, 4, 2048]
-            raw_tensor = torch.from_numpy(raw_feats).float().to(device).unsqueeze(1)
-            
-            # Encoder output: [B, 1, 1280]
-            aligned_feats = encoder(raw_tensor)
-            aligned_feats = aligned_feats.squeeze(1) # [B, 1280]
+
+            if use_token_infer:
+                tokens_list = extractors.extract_batch_tokens(
+                    images,
+                    max_tokens=student_tokens,
+                    return_torch=True,
+                )
+                tokens_list = [t.to(device) for t in tokens_list]
+                tokens_list = [t.unsqueeze(1) for t in tokens_list]  # [B, 1, K, C_i]
+                aligned_feats = encoder(tokens_list).squeeze(1)  # [B, 1280]
+                raw_tensor = None
+                raw_feats = None
+            else:
+                # 提取 4 model 特征 [B, 4, 2048]
+                # extract_batch 内部会处理 batch
+                raw_feats = extractors.extract_batch(images)
+                # raw_feats: [B, 4, 2048] -> [B, 1, 4, 2048]
+                raw_tensor = torch.from_numpy(raw_feats).float().to(device).unsqueeze(1)
+                # Encoder output: [B, 1, 1280]
+                aligned_feats = encoder(raw_tensor).squeeze(1)  # [B, 1280]
             
         all_aligned_feats.append(aligned_feats.cpu().numpy())
 
@@ -146,6 +158,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True, help='Use train_online_batch_extract.yaml to get paths')
     parser.add_argument('--output_dir', type=str, default=None, help='Override output dir')
+    parser.add_argument('--overwrite', action='store_true', help='Overwrite existing zarr outputs')
     args = parser.parse_args()
     
     config = load_config(args.config)
@@ -162,6 +175,7 @@ def main():
     else:
         output_root = Path(__file__).parent.parent / "features_dataset" / "aligned_zarr"
     
+    output_root.mkdir(parents=True, exist_ok=True)
     print(f"Data Root: {robotwin_data_root}")
     print(f"Output Root: {output_root}")
     print(f"Tasks: {tasks}")
@@ -174,10 +188,19 @@ def main():
     
     print("Loading Alignment Encoder...")
     encoder_path = config['encoder']['checkpoint']
+    enc_ckpt = torch.load(encoder_path, map_location='cpu')
+    enc_args = enc_ckpt.get('args', {}) if isinstance(enc_ckpt, dict) else {}
+    if not isinstance(enc_args, dict):
+        enc_args = vars(enc_args)
+    student_pool = str(enc_args.get('student_pool', 'mean'))
+    student_tokens = int(enc_args.get('student_tokens', 64))
+    use_token_infer = student_pool == 'tokens'
     encoder = RGB2PCAlignedEncoder4Models.from_checkpoint(
         encoder_path, map_location='cpu', freeze=True
     )
     encoder = encoder.to(f'cuda:{gpu_ids[0]}').eval()
+
+    print(f"Alignment mode: student_pool={student_pool}, student_tokens={student_tokens}")
     
     # 3. 处理每个任务
     for task in tasks:
@@ -201,7 +224,10 @@ def main():
                     extractors, encoder, camera_name,
                     batch_size=config['train']['batch_size'],
                     horizon=config['data']['horizon'],
-                    n_obs_steps=config['data']['n_obs_steps']
+                    n_obs_steps=config['data']['n_obs_steps'],
+                    use_token_infer=use_token_infer,
+                    student_tokens=student_tokens,
+                    overwrite=args.overwrite,
                 )
             except Exception as e:
                 print(f"Error processing {fpath}: {e}")

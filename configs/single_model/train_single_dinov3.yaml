@@ -38,5 +38,5 @@ device:
 
 # Checkpoint配置
 checkpoint:
-  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_single_model_ws1/lift_pot-demo_clean-50-vggt
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_single_model_ws1/lift_pot-demo_clean-50-dinov3
   save_every: 50

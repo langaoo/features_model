@@ -71,6 +71,22 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+class TokenAttentionPool(nn.Module):
+    """轻量token attention pooling：学习一个query向量对token加权汇聚。"""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B,K,D]
+        if x.ndim != 3:
+            raise ValueError(f"TokenAttentionPool expects [B,K,D], got {tuple(x.shape)}")
+        dim = x.shape[-1]
+        scores = (x * self.query).sum(dim=-1) / math.sqrt(float(dim))
+        weights = torch.softmax(scores, dim=1)
+        return (x * weights.unsqueeze(-1)).sum(dim=1)
+
+
 class RGB2PCAlignedEncoder4Models(nn.Module):
     """Load full 4-model student encoder from ckpt."""
 
@@ -117,7 +133,7 @@ class RGB2PCAlignedEncoder4Models(nn.Module):
                 dim_feedforward=int(spec.fuse_dim) * 4,
                 dropout=0.1,
                 activation='gelu',
-                batch_first=False
+                batch_first=True
             )
             self.context_encoder = nn.TransformerEncoder(context_layer, num_layers=context_layers)
         else:
@@ -140,6 +156,7 @@ class RGB2PCAlignedEncoder4Models(nn.Module):
                 return self.net(x)
 
         self.proj_student = _ProjMLP(int(spec.fuse_dim))
+        self.token_pooler: TokenAttentionPool | None = None
 
     @classmethod
     def from_checkpoint(
@@ -176,6 +193,7 @@ class RGB2PCAlignedEncoder4Models(nn.Module):
 
         # check if context_encoder exists in checkpoint
         use_context = "context_encoder" in ckpt and "pos_encoder" in ckpt
+        token_pool = str(args.get("token_pool", "mean"))
 
         spec = RGB2PCAligned4ModelSpec(n_models=4, in_dims=tuple(in_dims), fuse_dim=fuse_dim, fusion=fusion)
         model = cls(spec, moe_hidden=moe_hidden, use_context=use_context)
@@ -223,6 +241,11 @@ class RGB2PCAlignedEncoder4Models(nn.Module):
             proj_sd = _strip_module_prefix(proj_sd)
             model.proj_student.load_state_dict(proj_sd, strict=True)
 
+        token_pooler_sd = ckpt.get("token_pooler")
+        if token_pooler_sd is not None and token_pool == "attn":
+            model.token_pooler = TokenAttentionPool(int(spec.fuse_dim))
+            model.token_pooler.load_state_dict(_strip_module_prefix(token_pooler_sd), strict=True)
+
         if freeze:
             for p in model.parameters():
                 p.requires_grad = False
@@ -230,35 +253,68 @@ class RGB2PCAlignedEncoder4Models(nn.Module):
 
         return model
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B,To,M,C]
-        if x.ndim != 4:
-            raise ValueError(f"Expected x [B,To,M,C], got {tuple(x.shape)}")
-        b, t, m, c = x.shape
+    def forward(self, x) -> torch.Tensor:
+        """
+        支持两种输入：
+        1) pooled: x = Tensor[B, To, M, C]
+        2) tokens: x = List[Tensor]，每个元素 [B, To, K, C_i]
+        """
+        weight_dtype = next(self.parameters()).dtype
+
+        if isinstance(x, (list, tuple)):
+            toks_list = x
+            if len(toks_list) != int(self.spec.n_models):
+                raise ValueError(f"Model count mismatch: got {len(toks_list)}, expected {self.spec.n_models}")
+            b, t, k, _ = toks_list[0].shape
+
+            z_tokens_list = []
+            for mi, toks in enumerate(toks_list):
+                ci = int(self.spec.in_dims[mi])
+                toks = toks[..., :ci].to(dtype=weight_dtype)
+                tok_flat = toks.reshape(b * t, k, ci)
+                z = self.adapters[mi](tok_flat.reshape(b * t * k, ci)).reshape(b * t, k, -1)
+                z_tokens_list.append(z)
+
+            z_flat_list = [z.reshape(b * t * k, -1) for z in z_tokens_list]
+            z_fused_flat, _w = self.fusion(z_flat_list)
+            z_fused_tokens = z_fused_flat.reshape(b * t, k, -1)
+
+            if self.use_context and self.context_encoder is not None:
+                z_pos = self.pos_encoder(z_fused_tokens.transpose(0, 1)).transpose(0, 1)
+                z_enhanced = self.context_encoder(z_pos)
+            else:
+                z_enhanced = z_fused_tokens
+
+            z_mean = z_enhanced.mean(dim=1)
+            if self.token_pooler is not None:
+                z_final = self.token_pooler(z_enhanced)
+            else:
+                z_final = z_mean
+
+            fused = self.proj_student(z_final).reshape(b, t, -1)
+            return fused
+
+        if not isinstance(x, torch.Tensor) or x.ndim != 4:
+            raise ValueError(f"Expected pooled Tensor [B,To,M,C], got {type(x)} shape={getattr(x, 'shape', None)}")
+
+        b, t, m, _c = x.shape
         if m != int(self.spec.n_models):
             raise ValueError(f"Model count mismatch: got {m}, expected {self.spec.n_models}")
-        # support hetero dims: for simplicity require caller to pad/pack to the right dims per model
 
-        weight_dtype = next(self.parameters()).dtype
         x = x.to(dtype=weight_dtype)
-
         zs = []
         for mi in range(m):
             ci = int(self.spec.in_dims[mi])
             tok = x[:, :, mi, :ci].reshape(b * t, ci)
-            z = self.adapters[mi](tok)  # [B*T,D]
+            z = self.adapters[mi](tok)
             zs.append(z)
 
-        fused, _w = self.fusion(zs)  # [B*T,D]
-        fused = fused.reshape(b, t, -1)  # [B,T,D]
+        fused, _w = self.fusion(zs)
+        fused = fused.reshape(b, t, -1)
 
-        # apply context encoder if available
         if self.use_context and self.context_encoder is not None:
-            # Transformer expects [T, B, D]
-            fused_transposed = fused.transpose(0, 1)  # [T, B, D]
-            fused_transposed = self.pos_encoder(fused_transposed)
-            enhanced = self.context_encoder(fused_transposed)  # [T, B, D]
-            fused = enhanced.transpose(0, 1)
+            fused = self.pos_encoder(fused.transpose(0, 1)).transpose(0, 1)
+            fused = self.context_encoder(fused)
 
         fused = self.proj_student(fused.reshape(b * t, -1)).reshape(b, t, -1)
         return fused

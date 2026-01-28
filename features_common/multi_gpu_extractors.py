@@ -236,6 +236,39 @@ class MultiGPUFeatureExtractors:
             axis=1,
         )
 
+    def extract_batch_tokens(
+        self,
+        images: List[Image.Image],
+        *,
+        max_tokens: int | None = None,
+        return_torch: bool = True,
+    ):
+        """
+        批量提取多帧 token 特征（不做均值池化）
+
+        Args:
+            images: List of PIL Image (RGB)
+            max_tokens: 若指定，则每个样本随机采样 K 个 token
+            return_torch: True 返回 torch.Tensor；False 返回 numpy
+
+        Returns:
+            tokens_list: list[Tensor], len=4
+                每个元素形状为 [B, K, C_i]（若 max_tokens 为空，则 K=原始 token 数）
+        """
+        tokens_list = []
+        for name in ['croco', 'vggt', 'dinov3', 'da3']:
+            toks = self.extractors[name].extract_batch_tokens(
+                images,
+                max_tokens=max_tokens,
+                return_torch=True,
+            )
+            tokens_list.append(toks)
+
+        if return_torch:
+            return tokens_list
+
+        return [t.detach().cpu().numpy() for t in tokens_list]
+
     def __call__(self, image: Image.Image) -> np.ndarray:
         return self.extract(image)
 
@@ -448,4 +481,155 @@ class FeatureExtractorWrapper:
             batch_feats.append(f)
             
         return np.stack(batch_feats, axis=0)
+
+    def extract_batch_tokens(
+        self,
+        images: List[Image.Image],
+        *,
+        max_tokens: int | None = None,
+        return_torch: bool = True,
+    ):
+        """
+        批量提取 token 特征（不做均值池化）
+
+        Returns:
+            tokens: [B, K, C] torch.Tensor 或 numpy
+        """
+        B = len(images)
+        with torch.no_grad():
+            if self.model_name == 'croco':
+                from torchvision import transforms
+                from torchvision.transforms import InterpolationMode
+                transform = transforms.Compose([
+                    transforms.Resize((224, 224), interpolation=InterpolationMode.BICUBIC),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ])
+                img_tensors = torch.stack([transform(img) for img in images]).to(self.device)
+                feat = self.model._encode_image(img_tensors, do_mask=False)[0]  # [B, N, C]
+                tokens = feat
+
+            elif self.model_name == 'dinov3':
+                from torchvision import transforms
+                image_size = self.dinov3_image_size or 224
+                image_mean = self.dinov3_image_mean or [0.485, 0.456, 0.406]
+                image_std = self.dinov3_image_std or [0.229, 0.224, 0.225]
+                transform = transforms.Compose([
+                    transforms.Resize((image_size, image_size)),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=image_mean, std=image_std),
+                ])
+                img_tensors = torch.stack([transform(img) for img in images]).to(self.device)
+                if hasattr(self.model, "get_intermediate_layers"):
+                    y = self.model.get_intermediate_layers(img_tensors, n=1)[0]
+                else:
+                    y = self.model(img_tensors)
+                patch_tokens = self.patch_tokens or (y.shape[1] - 1)
+                tokens = y[:, -patch_tokens:, :]
+
+            elif self.model_name == 'vggt':
+                from vggt.utils.load_fn import load_and_preprocess_images
+                import tempfile
+                import os as _os
+                temp_paths = []
+                try:
+                    for img in images:
+                        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+                            temp_paths.append(f.name)
+                            img.save(f.name)
+                    imgs = load_and_preprocess_images(temp_paths)
+                    imgs = imgs.unsqueeze(1).to(self.device)  # [B, 1, 3, 518, 518]
+                    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+                        amp_dtype = torch.bfloat16
+                    else:
+                        amp_dtype = torch.float16
+                    with torch.cuda.amp.autocast(dtype=amp_dtype):
+                        aggregated_tokens_list, patch_start_idx = self.model.aggregator(imgs)
+                    last_tokens = aggregated_tokens_list[-1]  # [B, 1, N, C]
+                    patch_tokens = last_tokens[:, :, patch_start_idx:, :]  # [B, 1, Np, C]
+                    tokens = patch_tokens.squeeze(1)  # [B, Np, C]
+                finally:
+                    for p in temp_paths:
+                        if _os.path.exists(p):
+                            _os.unlink(p)
+
+            elif self.model_name == 'da3':
+                import tempfile
+                import os as _os
+
+                def _da3_forward_from_paths(paths: list[str]) -> torch.Tensor:
+                    imgs_cpu, _, _ = self.model._preprocess_inputs(
+                        paths,
+                        extrinsics=None,
+                        intrinsics=None,
+                        process_res=self.da3_process_res or 504,
+                        process_res_method=self.da3_process_res_method,
+                    )
+                    imgs, _, _ = self.model._prepare_model_inputs(imgs_cpu, None, None)
+                    if isinstance(imgs, (list, tuple)):
+                        img_list = []
+                        for x in imgs:
+                            if isinstance(x, torch.Tensor):
+                                if x.ndim == 3:
+                                    x = x.unsqueeze(0)
+                                img_list.append(x)
+                        if len(img_list) == 0:
+                            raise RuntimeError("DA3 _prepare_model_inputs returned empty list")
+                        imgs = torch.cat(img_list, dim=0)
+                    if not isinstance(imgs, torch.Tensor):
+                        raise RuntimeError(f"DA3 _prepare_model_inputs returned unexpected type: {type(imgs)}")
+
+                    imgs = imgs.to(self.device)
+                    backbone = self.model.model.backbone
+                    feats, _ = backbone(x=imgs, export_feat_layers=[23])
+                    if not feats:
+                        raise RuntimeError("backbone返回空特征")
+                    tokens, _ = feats[0]
+                    # tokens: [B, H, W, C] 或 [B, N, C]
+                    if tokens.ndim == 4:
+                        tokens = tokens.flatten(1, 2)
+                    return tokens
+
+                temp_paths = []
+                try:
+                    for img in images:
+                        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+                            temp_paths.append(f.name)
+                            img.save(f.name)
+                    tokens = _da3_forward_from_paths(temp_paths)
+                    if tokens.ndim == 2:
+                        tokens = tokens.unsqueeze(0)
+                    if tokens.shape[0] != B:
+                        per_tokens = []
+                        for p in temp_paths:
+                            t = _da3_forward_from_paths([p])
+                            if t.ndim == 2:
+                                t = t.unsqueeze(0)
+                            per_tokens.append(t[0])
+                        tokens = torch.stack(per_tokens, dim=0)
+                finally:
+                    for p in temp_paths:
+                        if _os.path.exists(p):
+                            _os.unlink(p)
+            else:
+                raise ValueError(f"Unknown model: {self.model_name}")
+
+        tokens = tokens.to(torch.float32)
+        if max_tokens is not None:
+            k = int(max_tokens)
+            if k <= 0:
+                raise ValueError(f"max_tokens must be positive, got {k}")
+            n = int(tokens.shape[1])
+            if n >= k:
+                idx = torch.randint(0, n, (B, k), device=tokens.device)
+                tokens = tokens.gather(1, idx.unsqueeze(-1).expand(-1, -1, tokens.shape[-1]))
+            else:
+                # pad by repeating when token count不足
+                pad_idx = torch.randint(0, n, (B, k - n), device=tokens.device)
+                pad = tokens.gather(1, pad_idx.unsqueeze(-1).expand(-1, -1, tokens.shape[-1]))
+                tokens = torch.cat([tokens, pad], dim=1)
+
+        if return_torch:
+            return tokens
+        return tokens.detach().cpu().numpy()
 
