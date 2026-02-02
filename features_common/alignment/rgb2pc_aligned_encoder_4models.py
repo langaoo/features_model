@@ -156,7 +156,9 @@ class RGB2PCAlignedEncoder4Models(nn.Module):
                 return self.net(x)
 
         self.proj_student = _ProjMLP(int(spec.fuse_dim))
-        self.token_pooler: TokenAttentionPool | None = None
+        self.token_pooler = None
+        self.residual_adapter = None
+        self.residual_alpha = 0.0
 
     @classmethod
     def from_checkpoint(
@@ -246,6 +248,26 @@ class RGB2PCAlignedEncoder4Models(nn.Module):
             model.token_pooler = TokenAttentionPool(int(spec.fuse_dim))
             model.token_pooler.load_state_dict(_strip_module_prefix(token_pooler_sd), strict=True)
 
+        residual_sd = ckpt.get("residual_adapter")
+        if residual_sd is not None:
+            class _ResidualMLP(nn.Module):
+                def __init__(self, dim: int):
+                    super().__init__()
+                    self.net = nn.Sequential(
+                        nn.Linear(dim, dim * 2),
+                        nn.GELU(),
+                        nn.Dropout(0.0),
+                        nn.Linear(dim * 2, dim),
+                        nn.LayerNorm(dim),
+                    )
+
+                def forward(self, x: torch.Tensor) -> torch.Tensor:
+                    return self.net(x)
+
+            model.residual_adapter = _ResidualMLP(int(spec.fuse_dim))
+            model.residual_adapter.load_state_dict(_strip_module_prefix(residual_sd), strict=True)
+            model.residual_alpha = float(args.get("residual_alpha", 0.3))
+
         if freeze:
             for p in model.parameters():
                 p.requires_grad = False
@@ -253,7 +275,7 @@ class RGB2PCAlignedEncoder4Models(nn.Module):
 
         return model
 
-    def forward(self, x) -> torch.Tensor:
+    def forward(self, x, *, return_tokens: bool = False):
         """
         支持两种输入：
         1) pooled: x = Tensor[B, To, M, C]
@@ -279,19 +301,35 @@ class RGB2PCAlignedEncoder4Models(nn.Module):
             z_fused_flat, _w = self.fusion(z_flat_list)
             z_fused_tokens = z_fused_flat.reshape(b * t, k, -1)
 
-            if self.use_context and self.context_encoder is not None:
-                z_pos = self.pos_encoder(z_fused_tokens.transpose(0, 1)).transpose(0, 1)
-                z_enhanced = self.context_encoder(z_pos)
-            else:
-                z_enhanced = z_fused_tokens
-
-            z_mean = z_enhanced.mean(dim=1)
+            # Global流：不经Context，等价于纯pool
+            z_global_tokens = z_fused_tokens
+            z_mean = z_global_tokens.mean(dim=1)
             if self.token_pooler is not None:
-                z_final = self.token_pooler(z_enhanced)
+                z_final = self.token_pooler(z_global_tokens)
             else:
                 z_final = z_mean
 
             fused = self.proj_student(z_final).reshape(b, t, -1)
+
+            # Spatial流：Context + Residual
+            # 🔧 修复: TransformerEncoder 期望输入格式 [S, B, D]
+            #    z_fused_tokens 是 [B*T, K, D]，需要转置为 [K, B*T, D]
+            if self.use_context and self.context_encoder is not None:
+                # z_fused_tokens: [B*T, K, D] -> transpose -> [K, B*T, D]
+                z_trans = z_fused_tokens.transpose(0, 1)  # [K, B*T, D]
+                z_pos = self.pos_encoder(z_trans)  # [K, B*T, D]
+                z_spatial = self.context_encoder(z_pos)  # [K, B*T, D]
+                z_spatial = z_spatial.transpose(0, 1)  # 转回 [B*T, K, D]
+            else:
+                z_spatial = z_fused_tokens
+
+            if self.residual_adapter is not None:
+                delta = self.residual_adapter(z_spatial)
+                z_spatial = z_spatial + float(self.residual_alpha) * delta
+
+            if return_tokens:
+                tokens = self.proj_student(z_spatial.reshape(b * t, k, -1)).reshape(b, t, k, -1)
+                return fused, tokens
             return fused
 
         if not isinstance(x, torch.Tensor) or x.ndim != 4:
@@ -317,4 +355,6 @@ class RGB2PCAlignedEncoder4Models(nn.Module):
             fused = self.context_encoder(fused)
 
         fused = self.proj_student(fused.reshape(b * t, -1)).reshape(b, t, -1)
+        if return_tokens:
+            return fused, None
         return fused

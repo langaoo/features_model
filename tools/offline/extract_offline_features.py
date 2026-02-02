@@ -47,6 +47,7 @@ def extract_episode(
     use_token_infer: bool = False,
     student_tokens: int = 64,
     overwrite: bool = False,
+    save_tokens: bool = False,
 ):
     """处理单个episode"""
     if output_path.exists() and not overwrite:
@@ -87,6 +88,7 @@ def extract_episode(
 
     # 2. 批量提取
     all_aligned_feats = []
+    all_token_feats = []
     
     # 再次打开文件以流式读取图像
     f = h5py.File(episode_path, 'r')
@@ -118,7 +120,13 @@ def extract_episode(
                 )
                 tokens_list = [t.to(device) for t in tokens_list]
                 tokens_list = [t.unsqueeze(1) for t in tokens_list]  # [B, 1, K, C_i]
-                aligned_feats = encoder(tokens_list).squeeze(1)  # [B, 1280]
+                if save_tokens:
+                    aligned_feats, token_feats = encoder(tokens_list, return_tokens=True)
+                    aligned_feats = aligned_feats.squeeze(1)
+                    token_feats = token_feats.squeeze(1)
+                else:
+                    aligned_feats = encoder(tokens_list).squeeze(1)  # [B, 1280]
+                    token_feats = None
                 raw_tensor = None
                 raw_feats = None
             else:
@@ -128,9 +136,16 @@ def extract_episode(
                 # raw_feats: [B, 4, 2048] -> [B, 1, 4, 2048]
                 raw_tensor = torch.from_numpy(raw_feats).float().to(device).unsqueeze(1)
                 # Encoder output: [B, 1, 1280]
-                aligned_feats = encoder(raw_tensor).squeeze(1)  # [B, 1280]
+                if save_tokens:
+                    aligned_feats, token_feats = encoder(raw_tensor, return_tokens=True)
+                    aligned_feats = aligned_feats.squeeze(1)
+                else:
+                    aligned_feats = encoder(raw_tensor).squeeze(1)  # [B, 1280]
+                    token_feats = None
             
         all_aligned_feats.append(aligned_feats.cpu().numpy())
+        if save_tokens and token_feats is not None:
+            all_token_feats.append(token_feats.cpu().numpy())
 
         # 释放显存，避免长序列处理时显存累积
         del raw_feats, raw_tensor, aligned_feats
@@ -140,6 +155,7 @@ def extract_episode(
     
     # 合并
     obs_aligned = np.concatenate(all_aligned_feats, axis=0) # [T, 1280]
+    obs_tokens = np.concatenate(all_token_feats, axis=0) if (save_tokens and all_token_feats) else None
     
     # 3. 保存 Zarr
     # 创建目录
@@ -147,6 +163,13 @@ def extract_episode(
     
     root = zarr.open(str(output_path), mode='w')
     root.create_dataset('obs_aligned', data=obs_aligned, chunks=(100, 1280), dtype='float32')
+    if obs_tokens is not None:
+        root.create_dataset(
+            'obs_tokens',
+            data=obs_tokens,
+            chunks=(20, obs_tokens.shape[1], obs_tokens.shape[2]),
+            dtype='float32'
+        )
     root.create_dataset('action', data=action, chunks=(100, action.shape[1]), dtype='float32')
     
     # 保存元数据
@@ -195,12 +218,13 @@ def main():
     student_pool = str(enc_args.get('student_pool', 'mean'))
     student_tokens = int(enc_args.get('student_tokens', 64))
     use_token_infer = student_pool == 'tokens'
+    save_tokens = bool(config.get('encoder', {}).get('save_tokens', False))
     encoder = RGB2PCAlignedEncoder4Models.from_checkpoint(
         encoder_path, map_location='cpu', freeze=True
     )
     encoder = encoder.to(f'cuda:{gpu_ids[0]}').eval()
 
-    print(f"Alignment mode: student_pool={student_pool}, student_tokens={student_tokens}")
+    print(f"Alignment mode: student_pool={student_pool}, student_tokens={student_tokens}, save_tokens={save_tokens}")
     
     # 3. 处理每个任务
     for task in tasks:
@@ -228,6 +252,7 @@ def main():
                     use_token_infer=use_token_infer,
                     student_tokens=student_tokens,
                     overwrite=args.overwrite,
+                    save_tokens=save_tokens,
                 )
             except Exception as e:
                 print(f"Error processing {fpath}: {e}")

@@ -621,13 +621,18 @@ class FeatureExtractorWrapper:
                 raise ValueError(f"max_tokens must be positive, got {k}")
             n = int(tokens.shape[1])
             if n >= k:
-                idx = torch.randint(0, n, (B, k), device=tokens.device)
+                # 🔧 修复：使用确定性等间隔采样，保证相同输入产生相同输出
+                # 这解决了推理时每次随机采样不同tokens导致特征闪烁的问题
+                idx = torch.linspace(0, n - 1, k, device=tokens.device).long()
+                idx = idx.unsqueeze(0).expand(B, -1)  # [B, k]
                 tokens = tokens.gather(1, idx.unsqueeze(-1).expand(-1, -1, tokens.shape[-1]))
             else:
                 # pad by repeating when token count不足
-                pad_idx = torch.randint(0, n, (B, k - n), device=tokens.device)
-                pad = tokens.gather(1, pad_idx.unsqueeze(-1).expand(-1, -1, tokens.shape[-1]))
-                tokens = torch.cat([tokens, pad], dim=1)
+                # 使用确定性循环填充
+                repeat_times = (k + n - 1) // n
+                idx = torch.arange(n, device=tokens.device).repeat(repeat_times)[:k]
+                idx = idx.unsqueeze(0).expand(B, -1)  # [B, k]
+                tokens = tokens.gather(1, idx.unsqueeze(-1).expand(-1, -1, tokens.shape[-1]))
 
         if return_torch:
             return tokens

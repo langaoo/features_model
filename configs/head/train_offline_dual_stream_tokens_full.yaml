@@ -1,7 +1,7 @@
-# 离线训练配置 - ws1 对齐特征
+# 离线训练配置 - Dual-Stream (全量)
 
 data:
-  features_dataset_dir: /home/gl/RoboTwin/policy/DP2DP3/features_model/data/offline_features_ws1
+  features_dataset_dir: /home/gl/RoboTwin/policy/DP2DP3/features_model/data/offline_features_dual_stream_tokens_full
 
   horizon: 8
   n_obs_steps: 2
@@ -18,7 +18,8 @@ data:
   include_gripper: true
 
 encoder:
-  checkpoint: /home/gl/RoboTwin/policy/DP2DP3/features_model/outputs/train_rgb2pc_runs/run_ws1/ckpt_final.pt
+  checkpoint: /home/gl/RoboTwin/policy/DP2DP3/features_model/outputs/train_rgb2pc_runs/run_ws1_tokens_full/ckpt_final.pt
+  save_tokens: true
 
 train:
   epochs: 600
@@ -33,17 +34,21 @@ policy:
   use_official_dp: true
   num_inference_steps: 100
   hidden_dim: 512
+  use_tokens: true
+  token_gate_init: -4.0
+  token_dropout: 0.1
+  ctx_dropout: 0.1
 
 device:
-  gpu_ids: [0,1]
+  gpu_ids: [0, 1]
 
 output:
   dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints
-  save_every_n_epochs: 300
+  save_every_n_epochs: 100
 
 checkpoint:
   expert_data_num: 50
-  ckpt_setting: demo_clean
+  ckpt_setting: demo_clean_dual_stream_tokens_full
   seed: 0
 
 debug:

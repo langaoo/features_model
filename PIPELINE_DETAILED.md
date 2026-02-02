@@ -287,6 +287,196 @@ outputs/train_rgb2pc_runs/run_best_bs32/
 
 ---
 
+### 2048维的来源与含义（不是点云2048）
+
+**结论**：在线推理阶段的 `2048` 维是**视觉特征对齐时的统一维度**，
+与点云的 `2048` 采样点数**没有直接关系**。
+
+- 4个视觉模型原始维度分别是：`[1024, 2048, 768, 2048]`
+- 在线推理为了让 4 模型能统一堆叠，采用**固定维度 2048**：
+  - 如果维度不足就 `pad`，
+  - 如果维度过大就截断。
+- 这个设计是**工程上的统一接口**，不是物理含义。
+
+**对齐训练时**不会强制 2048：
+- token级对齐使用的是各自的 `C_i`
+- adapter 会统一映射到 1280
+
+---
+
+### 训练/推理数据流（pool vs tokens 全流程）
+
+下面按 **“训练对齐 + 在线推理”** 两条主线说明，并明确 `tokens` 与 `pool` 的区别。
+
+#### A) 对齐训练（student_pool=tokens）
+1. **RGB特征（Zarr）**
+    - `[W, T, Hf, Wf, C_i]`
+2. **采样K个token**
+    - 每模型 `[K, C_i]`
+    - 多模型堆叠：`[B, 4, K, C_i]`
+3. **Adapter（每token）**
+    - `C_i → 1280` 得到 `[B, 4, K, 1280]`
+4. **Fusion（token级）**
+    - 融合到 `[B, K, 1280]`
+5. **Context Encoder（token级）**
+    - 保持 `[B, K, 1280]`
+6. **Token Pool（mean 或 attn）**
+    - 得到样本级向量 `[B, 1280]`
+7. **Projection → 对齐监督（点云向量）**
+    - 学到 RGB→PC 对齐向量
+
+#### B) 对齐训练（student_pool=mean）
+1. 仍从 `[Hf, Wf, C_i]` 中取 token
+2. **先做 mean pool** → `[B, 4, C_i]`
+3. Adapter/Fusion/Projection → `[B, 1280]`
+4. 与点云向量对齐
+
+#### C) 在线推理（当前 token-level 模式）
+1. **实时图像**：每步 `[H, W, 3]`
+2. **在线模型输出 token**：每模型 `[K, C_i]`
+3. **堆叠成 `[1, To, K, C_i]`**
+4. **对齐编码器（token路径）** → `[1, To, 1280]`
+5. **Diffusion Head** → `[1, horizon, 14]`
+6. **Receding Horizon 执行前 action_exec 步**
+
+#### D) 在线推理（pooled 模式）
+1. 在线模型先 pool → 每模型 `[2048]`
+2. 堆叠成 `[1, To, 4, 2048]`
+3. 对齐编码器（pooled路径） → `[1, To, 1280]`
+
+**核心区别**：
+- `tokens` 模式保留了局部token语义，aligner内部再做 pooling
+- `mean` 模式在提取器就池化，aligner只看全局向量
+
+---
+
+### 五种方案总览（清晰对比版）
+
+下面按你的 5 种方案给出 **输入/输出形状**、**训练/推理脚本** 与 **关键文件**。
+
+#### 方案1：单模型（Single Model）
+- **核心思想**：只用一个视觉模型（如 DINOv3），避免融合干扰。
+- **输入形状**：
+    - 训练：`[B, To, D]`（单模型特征）
+    - 推理：`[1, To, D]`
+- **关键文件**：
+    - 训练：`tools/single_model/train_single_model_offline.py`
+    - 配置：`configs/single_model/train_single_dinov3.yaml`
+    - 推理：`policy/DP2DP3/deploy_single_model_policy.py`
+    - 评估脚本：`policy/DP2DP3/eval_single_model.sh`
+- **典型命令**：
+    ```bash
+    cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+    python tools/single_model/train_single_model_offline.py \
+            --config configs/single_model/train_single_dinov3.yaml
+    ```
+    - **推理命令**：
+        ```bash
+        cd /home/gl/RoboTwin
+        bash policy/DP2DP3/eval_single_model.sh \
+                lift_pot demo_clean demo_clean 50 0 "0,1" best dinov3
+        ```
+
+#### 方案2：直融（Direct Fusion, 无对齐模块）
+- **核心思想**：4 模型特征直接融合，不经过 RGB→PC 对齐。
+- **输入形状**：
+    - 训练：`[B, To, 4, D_i]`（每模型维度不同）
+    - 融合后：`[B, To, D_fused]`（weighted/concat/mean）
+    - 推理：`[1, To, D_fused]`
+- **关键文件**：
+    - 训练：`tools/direct_fusion/train_direct_fusion_offline.py`
+    - 配置：`configs/direct_fusion/train_direct_fusion_{task}.yaml`
+    - 推理：`policy/DP2DP3/deploy_direct_fusion_policy.py`
+    - 评估脚本：`policy/DP2DP3/eval_direct_fusion.sh`
+- **典型命令**：
+    ```bash
+    cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+    python tools/direct_fusion/train_direct_fusion_offline.py \
+            --config configs/direct_fusion/train_direct_fusion_lift_pot.yaml
+    ```
+    - **推理命令**：
+        ```bash
+        cd /home/gl/RoboTwin
+        bash policy/DP2DP3/eval_direct_fusion.sh \
+                lift_pot demo_clean demo_clean 50 0 "0,1" best
+        ```
+
+#### 方案3：Mean 方式的纯 Pool 对齐（student_pool=mean）
+- **核心思想**：先对每模型 token 做 mean pool，再进入对齐模块。
+- **输入形状**：
+    - Token采样：`[B, 4, K, C_i]`
+    - Mean pool 后：`[B, 4, C_i]`
+    - 对齐输出：`[B, 1280]`
+- **关键文件**：
+    - 对齐训练：`tools/alignment/train_rgb2pc_distill.py`
+    - 对齐配置：`configs/alignment/train_rgb2pc_distill_default.yaml`
+    - Head训练：`tools/offline/train_offline_head.py`
+    - 推理：`policy/DP2DP3/deploy_policy.py`（`use_token_infer=false`）
+    - **训练命令**：
+        ```bash
+        cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+        python tools/offline/train_offline_head.py \
+                --config configs/head/train_offline.yaml
+        ```
+    - **推理命令**：
+        ```bash
+        cd /home/gl/RoboTwin
+        bash policy/DP2DP3/eval.sh \
+                lift_pot demo_clean demo_clean 50 0 "0,1" best 4 100
+        ```
+
+#### 方案4：双流（pool + token pool）
+- **核心思想**：对齐模块输出 **pooled 全局特征** + **token 分支**（token 经过 pooling）。
+- **输入形状**：
+    - token输入：`[B, To, K, C_i]`
+    - token路径输出：`[B, To, K, 1280]` → pooled → `[B, To, 1280]`
+    - global路径输出：`[B, To, 1280]`
+    - Head条件：`[B, To, 1280]` + token ctx
+- **关键文件**：
+    - 对齐：`features_common/alignment/rgb2pc_aligned_encoder_4models.py`
+    - Head：`tools/offline/train_offline_head.py`
+    - 推理：`policy/DP2DP3/deploy_policy.py`
+    - **训练命令**：
+        ```bash
+        cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+        python tools/offline/train_offline_head.py \
+                --config configs/head/train_offline_dual_stream.yaml
+        ```
+    - **推理命令**：
+        ```bash
+        cd /home/gl/RoboTwin
+        bash policy/DP2DP3/eval.sh \
+                lift_pot demo_clean demo_clean_dual_stream 50 0 "0,1" best 4 100
+        ```
+
+#### 方案5：双流（pool + token-full）
+- **核心思想**：使用 **1024 全 token**，保留空间细节，token 分支不做提前池化。
+- **输入形状**：
+    - token输入：`[B, To, K=1024, C_i]`
+    - 对齐输出：`[B, To, 1280]` + `obs_tokens: [B, To, K, 1280]`
+    - Head条件：`[B, To, 1280]` + `obs_tokens`
+- **关键文件**：
+    - 特征提取：`tools/offline/extract_offline_features.py`
+    - token-full配置：`configs/head/train_online_batch_extract_dual_stream_tokens_full.yaml`
+    - Head训练：`tools/offline/train_offline_head.py`
+    - 推理：`policy/DP2DP3/deploy_policy.py`（`use_token_infer=true`）
+    - **训练命令**：
+        ```bash
+        cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+        python tools/offline/train_offline_head.py \
+                --config configs/head/train_offline_dual_stream_tokens_full.yaml
+        ```
+    - **推理命令**：
+        ```bash
+        cd /home/gl/RoboTwin
+        bash policy/DP2DP3/eval.sh \
+                lift_pot demo_clean demo_clean_dual_stream_tokens_full 50 0 "0,1" best 4 100
+        ```
+
+---
+
+---
+
 ## 步骤4B: 直接融合训练 (无对齐模块) ⭐简化方案
 
 **目的**: 跳过复杂的RGB→PC对齐步骤，直接融合4个视觉模型的RGB特征训练动作头
@@ -631,7 +821,7 @@ RGB特征 [B, To, 4, 2048]
   [B, To×1280] → MLP → [B, 256]
 
 Diffusion UNet:
-  输入: noisy_action [B, Ta, 14]
+    输入: noisy_action [B, Ta, 14]  # Ta=horizon，不是n_obs_steps
   条件: obs_cond [B, 256]
   输出: noise_pred [B, Ta, 14]
   
@@ -690,6 +880,8 @@ cd /home/gl/RoboTwin/policy/DP2DP3/features_model
 python tools/offline/extract_offline_features.py \
     --config configs/head/train_online_batch_extract.yaml \
     --output_dir data/offline_features
+
+python tools/offline/extract_offline_features.py --config configs/head/train_online_batch_extract_dual_stream_tokens_full.yaml --output_dir data/offline_features_dual_stream_tokens_full --overwrite
 
 # 步骤2: 离线训练Head
 python tools/offline/train_offline_head.py \

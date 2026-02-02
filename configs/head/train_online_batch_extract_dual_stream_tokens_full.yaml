@@ -1,4 +1,4 @@
-# 在线批量特征提取配置（ws1对齐模块）
+# 在线批量特征提取配置（Dual-Stream）
 
 data:
   robotwin_data_root: /home/gl/RoboTwin/data
@@ -15,13 +15,13 @@ data:
   use_right_arm: true
   fuse_arms: true
   include_gripper: true
-
 encoder:
-  checkpoint: /home/gl/RoboTwin/policy/DP2DP3/features_model/outputs/train_rgb2pc_runs/run_ws1/ckpt_final.pt
+  checkpoint: /home/gl/RoboTwin/policy/DP2DP3/features_model/outputs/train_rgb2pc_runs/run_ws1_tokens_full/ckpt_final.pt
   freeze: true
+  save_tokens: true
 
 train:
-  epochs: 500
+  epochs: 600
   batch_size: 8
   batch_extract: true
   lr: 1e-4
@@ -34,18 +34,19 @@ policy:
   hidden_dim: 512
   use_official_dp: true
   num_inference_steps: 100
+  use_tokens: true
 
 device:
   gpu_ids: [0, 1]
 
 output:
-  dir: _runs/online_training_ws1
+  dir: _runs/online_training_dual_stream
   save_every_n_epochs: 50
   run_name: null
 
 checkpoint:
   expert_data_num: 50
-  ckpt_setting: demo_clean
+  ckpt_setting: demo_clean_dual_stream
   seed: 0
 
 debug:

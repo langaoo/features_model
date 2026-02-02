@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-离线Head训练脚本 - 读取预提取特征
+离线Head训练脚本 - 读取预提取特征，之前训练到了500ckpt的，但是断了的。现在希望重新训练一次。
 """
 import torch
 import torch.nn as nn
@@ -101,19 +101,7 @@ class DPRGBPolicy(nn.Module):
 
 class DPRGBDualStreamPolicy(nn.Module):
     """Dual-stream DP: global + token cross-attention conditioning."""
-    def __init__(
-        self,
-        obs_dim,
-        token_dim,
-        action_dim,
-        horizon,
-        n_obs_steps,
-        n_action_steps,
-        num_inference_steps=100,
-        token_dropout=0.0,
-        ctx_dropout=0.0,
-        token_gate_init=-4.0,
-    ):
+    def __init__(self, obs_dim, token_dim, action_dim, horizon, n_obs_steps, n_action_steps, num_inference_steps=100):
         super().__init__()
         if not HAS_OFFICIAL_DP:
             raise RuntimeError("DP not loaded")
@@ -128,9 +116,6 @@ class DPRGBDualStreamPolicy(nn.Module):
         self.token_proj = nn.Linear(token_dim, 256)
         self.query_proj = nn.Linear(256, 256)
         self.cross_attn = nn.MultiheadAttention(256, num_heads=8, batch_first=True)
-        self.token_dropout = nn.Dropout(float(token_dropout)) if float(token_dropout) > 0 else nn.Identity()
-        self.ctx_dropout = nn.Dropout(float(ctx_dropout)) if float(ctx_dropout) > 0 else nn.Identity()
-        self.token_gate = nn.Parameter(torch.tensor(float(token_gate_init)))
 
         self.noise_pred_net = ConditionalUnet1D(
             input_dim=action_dim,
@@ -151,84 +136,29 @@ class DPRGBDualStreamPolicy(nn.Module):
         self.action_dim = action_dim
         self.n_action_steps = n_action_steps
         self.n_obs_steps = n_obs_steps
-        self.use_normalizer = False
 
-    def _build_cond(self, obs_global, obs_tokens, force_gate: float = None):
-        """
-        构建条件特征
-        Args:
-            obs_global: [B, To, D] global特征
-            obs_tokens: [B, To, K, D] token特征
-            force_gate: 如果指定，强制使用该gate值（用于训练初期）
-        """
+    def _build_cond(self, obs_global, obs_tokens):
         B = obs_global.shape[0]
         obs_flat = obs_global.reshape(B, -1)
         global_cond = self.obs_encoder(obs_flat)
         tokens = obs_tokens.reshape(B, -1, obs_tokens.shape[-1])
         tokens = self.token_proj(tokens)
-        tokens = self.token_dropout(tokens)
         query = self.query_proj(global_cond).unsqueeze(1)
         ctx, _ = self.cross_attn(query, tokens, tokens)
-        ctx = self.ctx_dropout(ctx.squeeze(1))
-        
-        # 🔧 修复: 支持强制gate值，防止gate塌缩
-        if force_gate is not None:
-            gate = force_gate
-        else:
-            gate = torch.sigmoid(self.token_gate)
-        return global_cond + gate * ctx
+        return global_cond + ctx.squeeze(1)
 
-    def compute_loss(self, obs_global, obs_tokens, action_gt, 
-                     force_gate: float = None,
-                     gate_regularization: float = 0.0):
-        """
-        计算训练损失
-        Args:
-            force_gate: 强制gate值（训练初期使用0.5强制token分支学习）
-            gate_regularization: gate正则化系数，鼓励gate保持在合理范围
-        """
+    def compute_loss(self, obs_global, obs_tokens, action_gt):
         B = obs_global.shape[0]
         device = obs_global.device
 
         nactions = self.normalizer['action'].normalize(action_gt).to(device)
-        obs_cond = self._build_cond(obs_global, obs_tokens, force_gate=force_gate)
+        obs_cond = self._build_cond(obs_global, obs_tokens)
 
         timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (B,), device=device).long()
         noise = torch.randn(nactions.shape, device=device)
         noisy_actions = self.noise_scheduler.add_noise(nactions, noise, timesteps)
         noise_pred = self.noise_pred_net(noisy_actions, timesteps, global_cond=obs_cond)
-        
-        mse_loss = nn.functional.mse_loss(noise_pred, noise)
-        
-        # 🔧 新增: Gate正则化，防止gate塌缩到0
-        if gate_regularization > 0:
-            # 鼓励gate sigmoid在[0.3, 0.7]范围内
-            gate_sigmoid = torch.sigmoid(self.token_gate)
-            # 惩罚gate偏离0.5
-            gate_reg_loss = gate_regularization * (gate_sigmoid - 0.5).pow(2)
-            return mse_loss + gate_reg_loss
-        
-        return mse_loss
-
-    def forward(self, obs_global, obs_tokens):
-        """推理：生成动作序列 [B, Ta, A]。"""
-        B = obs_global.shape[0]
-        device = obs_global.device
-        obs_cond = self._build_cond(obs_global, obs_tokens)
-
-        action = torch.randn((B, self.n_action_steps, self.action_dim), device=device)
-        self.noise_scheduler.set_timesteps(self.num_inference_steps)
-        for t in self.noise_scheduler.timesteps:
-            noise_pred = self.noise_pred_net(
-                action,
-                t.unsqueeze(0).expand(B).to(device),
-                global_cond=obs_cond,
-            )
-            action = self.noise_scheduler.step(noise_pred, t, action).prev_sample
-
-        if self.use_normalizer:
-            action = self.normalizer.unnormalize({'action': action})['action']
-        return action
+        return nn.functional.mse_loss(noise_pred, noise)
 
 
 class OfflineFeatureDataset(Dataset):
@@ -280,27 +210,44 @@ class OfflineFeatureDataset(Dataset):
         root = zarr.open(zpath, mode='r')
         
         # 读取 Obs [T, 1280]
-        # 训练对齐推理：使用“历史帧”窗口 [t-n_obs_steps+1, ..., t]
-        n_frames = root.attrs['num_frames']
-        obs_end = min(start_idx + 1, n_frames)
-        obs_start = max(0, obs_end - self.n_obs_steps)
-
-        # 读取数据 (Zarr 支持切片，这里使用连续切片)
-        obs_data = root['obs_aligned'][obs_start:obs_end]
-        obs_tokens = root['obs_tokens'][obs_start:obs_end] if 'obs_tokens' in root else None
+        # 需要读取 start_idx 到 start_idx + n_obs_steps
+        # 注意边界处理
+        # 实际上 start_idx 是当前步。观测是历史。
+        # 通常 obs_steps=2 意味着 [Current, Current-1] 还是 [Current, Current+1]?
+        # 在 OnlineDataset 中：
+        # for i in range(start_idx, start_idx + n_obs_steps): ...
+        # 这意味着观测 feature 是未来的？ 不，start_idx 是时间轴上的点。
+        # 如果 start_idx 是 t，那么 obs 是 t, t+1。 action 是 t...t+H。
+        # 这是一个常见的误区。但我们要和 Train Online 对齐。
+        # train_online: range(start_idx, start_idx + self.n_obs_steps)
+        # 所以是 [t, t+1] (如果 n_obs=2)
         
-        # 如果不够长，前向补齐（复制第一帧），保持时序从旧到新
+        obs_indices = []
+        n_frames = root.attrs['num_frames']
+        for i in range(start_idx, start_idx + self.n_obs_steps):
+            # Clamp to max frame
+            idx_clamped = min(i, n_frames - 1)
+            obs_indices.append(idx_clamped)
+        
+        # 读取数据 (Zarr 支持切片，但不一定支持非连续索引高效读取，这里范围很小所以还好)
+        # 如果是连续的：
+        slice_start = start_idx
+        slice_end = min(start_idx + self.n_obs_steps, n_frames)
+        obs_data = root['obs_aligned'][slice_start:slice_end]
+        obs_tokens = root['obs_tokens'][slice_start:slice_end] if 'obs_tokens' in root else None
+        
+        # 如果不够长 Pad last
         if obs_data.shape[0] < self.n_obs_steps:
-            pad_len = self.n_obs_steps - obs_data.shape[0]
-            first_frame = obs_data[:1]
-            obs_data = np.concatenate([np.tile(first_frame, (pad_len, 1)), obs_data], axis=0)
-            if obs_tokens is not None:
-                first_tok = obs_tokens[:1]
-                obs_tokens = np.concatenate([np.tile(first_tok, (pad_len, 1, 1)), obs_tokens], axis=0)
+             pad_len = self.n_obs_steps - obs_data.shape[0]
+             last_frame = obs_data[-1:]
+             obs_data = np.concatenate([obs_data, np.tile(last_frame, (pad_len, 1))], axis=0)
+             if obs_tokens is not None:
+                 last_tok = obs_tokens[-1:]
+                 obs_tokens = np.concatenate([obs_tokens, np.tile(last_tok, (pad_len, 1, 1))], axis=0)
              
         # Action [T, 14]
-        # action 从当前帧开始，预测未来 horizon 步
-        act_slice_start = start_idx
+        # action 从 obs 窗口之后开始
+        act_slice_start = start_idx + self.n_obs_steps
         act_slice_end = min(act_slice_start + self.horizon, n_frames)
         action_data = root['action'][act_slice_start:act_slice_end]
         
@@ -363,9 +310,6 @@ def main():
     
     if use_tokens:
         token_dim = sample['obs_tokens'].shape[-1]
-        token_dropout = float(config.get('policy', {}).get('token_dropout', 0.0))
-        ctx_dropout = float(config.get('policy', {}).get('ctx_dropout', 0.0))
-        token_gate_init = float(config.get('policy', {}).get('token_gate_init', -4.0))
         policy = DPRGBDualStreamPolicy(
             obs_dim=obs_dim,
             token_dim=token_dim,
@@ -373,10 +317,7 @@ def main():
             horizon=config['data']['horizon'],
             n_obs_steps=config['data']['n_obs_steps'],
             n_action_steps=config['data']['horizon'],
-            num_inference_steps=config['policy']['num_inference_steps'],
-            token_dropout=token_dropout,
-            ctx_dropout=ctx_dropout,
-            token_gate_init=token_gate_init,
+            num_inference_steps=config['policy']['num_inference_steps']
         ).to(device)
     else:
         policy = DPRGBPolicy(
@@ -407,57 +348,16 @@ def main():
     # 3. Optimizer
     lr_value = float(config['train']['lr'])
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr_value)
-
-    # 3.1 Resume (optional)
-    resume_ckpt = config.get('train', {}).get('resume_ckpt')
-    start_epoch = 0
-    if resume_ckpt:
-        resume_path = Path(str(resume_ckpt))
-        if resume_path.exists():
-            payload = torch.load(resume_path, map_location=device)
-            if 'policy' in payload:
-                missing, unexpected = policy.load_state_dict(payload['policy'], strict=False)
-                if missing:
-                    print(f"[Resume] Missing keys: {missing}")
-                if unexpected:
-                    print(f"[Resume] Unexpected keys: {unexpected}")
-            if 'normalizer' in payload and hasattr(policy, 'normalizer'):
-                policy.normalizer.load_state_dict(payload['normalizer'])
-            if 'optimizer' in payload:
-                try:
-                    optimizer.load_state_dict(payload['optimizer'])
-                except Exception:
-                    print("[WARN] Optimizer state incompatible, continuing with fresh optimizer.")
-            start_epoch = int(payload.get('epoch', 0))
-            print(f"[Resume] Loaded {resume_path}, start_epoch={start_epoch}")
-        else:
-            print(f"[WARN] resume_ckpt not found: {resume_path}")
     
     # 4. Train Loop
     print("Starting Offline Training...")
     best_loss = float('inf')
     
-    # 🔧 新增: Gate训练策略配置
-    total_epochs = int(config['train']['epochs'])
-    gate_warmup_epochs = int(config.get('train', {}).get('gate_warmup_epochs', total_epochs // 3))  # 前1/3强制gate=0.5
-    gate_regularization = float(config.get('train', {}).get('gate_regularization', 0.01))  # gate正则化系数
-    print(f"[Gate Strategy] warmup_epochs={gate_warmup_epochs}, regularization={gate_regularization}")
-    
     global_step = 0
-    for epoch in range(start_epoch, int(config['train']['epochs'])):
+    for epoch in range(config['train']['epochs']):
         policy.train()
         epoch_loss = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}", ncols=100)
-        
-        # 🔧 计算当前epoch的gate策略
-        if epoch < gate_warmup_epochs:
-            # 预热阶段: 强制gate=0.5，让token分支必须学习
-            force_gate = 0.5
-            current_gate_reg = 0.0  # 预热阶段不需要正则化
-        else:
-            # 正常阶段: 使用可学习gate，加正则化防止塌缩
-            force_gate = None
-            current_gate_reg = gate_regularization
         
         for batch in pbar:
             try:
@@ -465,11 +365,7 @@ def main():
                 action = batch['action'].to(device)
                 if use_tokens:
                     obs_tokens = batch['obs_tokens'].to(device)
-                    loss = policy.compute_loss(
-                        obs, obs_tokens, action,
-                        force_gate=force_gate,
-                        gate_regularization=current_gate_reg
-                    )
+                    loss = policy.compute_loss(obs, obs_tokens, action)
                 else:
                     loss = policy.compute_loss(obs, action)
                 
@@ -502,15 +398,7 @@ def main():
             pbar.set_postfix({'loss': f"{loss.item():.4f}"})
             
         avg_loss = epoch_loss / len(dataloader)
-        
-        # 🔧 新增: 打印gate状态
-        if use_tokens and hasattr(policy, 'token_gate'):
-            gate_val = policy.token_gate.item()
-            gate_sigmoid = torch.sigmoid(policy.token_gate).item()
-            gate_status = "FORCED=0.5" if force_gate is not None else f"learnable"
-            print(f"Epoch {epoch+1} done. Avg Loss: {avg_loss:.4f}, Gate: {gate_val:.4f} (sigmoid={gate_sigmoid:.4f}, {gate_status})")
-        else:
-            print(f"Epoch {epoch+1} done. Avg Loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch+1} done. Avg Loss: {avg_loss:.4f}")
         
         if avg_loss < best_loss:
             best_loss = avg_loss

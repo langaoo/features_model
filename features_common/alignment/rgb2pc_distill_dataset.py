@@ -189,6 +189,8 @@ class RGB2PCDistillDataset(Dataset[DistillSample]):
         # glob for .zarr
         steps = sorted(ep_dir.glob("step_*.ply.ulip_*.zarr"))
         if not steps:
+            steps = sorted(ep_dir.glob("step_*.ply.ulip_tokens.zarr"))
+        if not steps:
             # fallback to .pt if no zarr found (backward compatibility)
             steps = sorted(ep_dir.glob("step_*.ply.ulip_*.pt"))
             # no steps found
@@ -205,10 +207,7 @@ class RGB2PCDistillDataset(Dataset[DistillSample]):
         else:
             # .zarr path
             zp = self.rng.choice(steps)
-            # open zarr array
-            arr = zarr.open(str(zp), mode="r")
-            # [N, D]
-            pc_feat = torch.from_numpy(arr[:]).to(torch.float32)
+            pc_feat = self._load_teacher_zarr_array(zp)
 
         n = int(pc_feat.shape[0])
         k = min(int(self.teacher_points), n)
@@ -224,8 +223,7 @@ class RGB2PCDistillDataset(Dataset[DistillSample]):
             # try zarr first
             cand = sorted(ep_dir.glob(f"{stem}.ply.ulip_*.zarr"))
             if cand:
-                arr = zarr.open(str(cand[0]), mode="r")
-                pc_feat = torch.from_numpy(arr[:]).to(torch.float32)
+                pc_feat = self._load_teacher_zarr_array(cand[0])
                 z_list.append(pc_feat.mean(dim=0))
                 continue
 
@@ -437,3 +435,18 @@ class RGB2PCDistillDataset(Dataset[DistillSample]):
                 raise
 
         return DistillSample(task=task, episode=episode, sample_unit="step", teacher_points=t_points, tokens_by_model=toks_by_model)
+
+    @staticmethod
+    def _load_teacher_zarr_array(zp: Path) -> torch.Tensor:
+        """兼容 teacher zarr: array 或 group(tokens/pc_feat)."""
+        arr = zarr.open(str(zp), mode="r")
+        if isinstance(arr, zarr.hierarchy.Group):
+            if "tokens" in arr:
+                data = arr["tokens"][:]
+            elif "pc_feat" in arr:
+                data = arr["pc_feat"][:]
+            else:
+                raise RuntimeError(f"teacher zarr group missing tokens/pc_feat: {zp}")
+        else:
+            data = arr[:]
+        return torch.from_numpy(data).to(torch.float32)

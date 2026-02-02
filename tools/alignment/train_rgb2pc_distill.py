@@ -84,6 +84,8 @@ def local_align_loss(z_tokens: torch.Tensor, t_points: torch.Tensor, *, tau: flo
     if z_tokens.ndim != 3 or t_points.ndim != 3:
         raise ValueError(f"local_align_loss expects [B,K,D] & [B,Kt,D], got {tuple(z_tokens.shape)} and {tuple(t_points.shape)}")
 
+    z_tokens = torch.nan_to_num(z_tokens, nan=0.0, posinf=1e6, neginf=-1e6)
+    t_points = torch.nan_to_num(t_points, nan=0.0, posinf=1e6, neginf=-1e6)
     zt = F.normalize(z_tokens, dim=-1)
     tp = F.normalize(t_points, dim=-1)
     sim = torch.einsum("bkd,bqd->bkq", zt, tp) / float(tau)
@@ -92,6 +94,49 @@ def local_align_loss(z_tokens: torch.Tensor, t_points: torch.Tensor, *, tau: flo
     tok_to_pt = torch.logsumexp(sim, dim=-1)  # [B,K]
     pt_to_tok = torch.logsumexp(sim, dim=-2)  # [B,Kt]
     return -0.5 * (tok_to_pt.mean() + pt_to_tok.mean())
+
+
+def chamfer_loss(
+    z_tokens: torch.Tensor,
+    t_points: torch.Tensor,
+    *,
+    max_tokens: int = 256,
+    max_points: int = 256,
+    normalize: bool = True,
+) -> torch.Tensor:
+    """
+    Chamfer集合距离（对称）：token集与点云集的最小距离平均。
+    z_tokens: [B,K,D], t_points: [B,M,D]
+    为控制复杂度，支持随机下采样到 max_tokens/max_points。
+    """
+    if z_tokens.ndim != 3 or t_points.ndim != 3:
+        raise ValueError(
+            f"chamfer_loss expects [B,K,D] & [B,M,D], got {tuple(z_tokens.shape)} and {tuple(t_points.shape)}"
+        )
+
+    B, K, _ = z_tokens.shape
+    _, M, _ = t_points.shape
+    if K > max_tokens:
+        idx = torch.randperm(K, device=z_tokens.device)[:max_tokens]
+        z_tokens = z_tokens[:, idx]
+    if M > max_points:
+        idx = torch.randperm(M, device=t_points.device)[:max_points]
+        t_points = t_points[:, idx]
+
+    z_tokens = z_tokens.float()
+    t_points = t_points.float()
+    z_tokens = torch.nan_to_num(z_tokens, nan=0.0, posinf=1e6, neginf=-1e6)
+    t_points = torch.nan_to_num(t_points, nan=0.0, posinf=1e6, neginf=-1e6)
+    if normalize:
+        z_tokens = F.normalize(z_tokens, dim=-1)
+        t_points = F.normalize(t_points, dim=-1)
+
+    dist = torch.cdist(z_tokens, t_points, p=2)  # [B,K,M]
+    dist = torch.nan_to_num(dist, nan=1e3, posinf=1e3, neginf=1e3)
+    dist = dist.clamp(max=1e3)
+    loss_tok = dist.min(dim=2).values.mean()
+    loss_pt = dist.min(dim=1).values.mean()
+    return 0.5 * (loss_tok + loss_pt)
 
 
 class MLP(nn.Module):
@@ -260,6 +305,12 @@ def main() -> None:
     ap.add_argument("--loss_local", type=float, default=0.0, help="局部token-点云对齐损失权重（无点云时自动跳过）")
     ap.add_argument("--local_tau", type=float, default=0.07, help="局部对齐温度系数")
     ap.add_argument("--loss_pool", type=float, default=0.0, help="token-attn与mean池化一致性损失权重")
+    ap.add_argument("--loss_chamfer", type=float, default=0.0, help="Chamfer集合对齐损失权重（token-点云）")
+    ap.add_argument("--chamfer_max_tokens", type=int, default=256, help="Chamfer损失token下采样上限")
+    ap.add_argument("--chamfer_max_points", type=int, default=256, help="Chamfer损失点云下采样上限")
+    ap.add_argument("--residual_adapter", action="store_true", help="启用token残差Adapter以注入空间感知")
+    ap.add_argument("--residual_alpha", type=float, default=0.3, help="残差Adapter缩放系数")
+    ap.add_argument("--residual_zero_init", action="store_true", help="残差Adapter零初始化（初始不改动token）")
 
     # -------------------------- 采样粒度参数 --------------------------
     ap.add_argument("--sample_unit", type=str, default="step", choices=["step", "window"], help="样本粒度：step=单帧，window=8帧窗口")
@@ -392,6 +443,17 @@ def main() -> None:
         context_encoder = None
         token_pooler = None
 
+    residual_adapter = None
+    if bool(args.residual_adapter) and use_token_pool:
+        residual_adapter = MLP(in_dim=int(args.fuse_dim), out_dim=int(args.fuse_dim), hidden_dim=int(args.fuse_dim)*2).to(device)
+        if bool(args.residual_zero_init):
+            # 仅将最后线性层置零，确保初始输出为0
+            last_linear = residual_adapter.net[3]
+            if isinstance(last_linear, nn.Linear):
+                nn.init.zeros_(last_linear.weight)
+                if last_linear.bias is not None:
+                    nn.init.zeros_(last_linear.bias)
+
     # 5.4 Student特征投影层：最终映射到teacher的特征空间，无teacher投影层（固定teacher特征，核心优化）
     proj_student = MLP(in_dim=int(args.fuse_dim), out_dim=int(args.fuse_dim), hidden_dim=int(args.fuse_dim)*2).to(device)
 
@@ -402,6 +464,8 @@ def main() -> None:
         params = params + list(context_encoder.parameters())
     if token_pooler is not None:
         params = params + list(token_pooler.parameters())
+    if residual_adapter is not None:
+        params = params + list(residual_adapter.parameters())
     opt = torch.optim.AdamW(params, lr=float(args.lr), weight_decay=float(args.weight_decay))  # 修复：参数已定义，可正常使用
     # 余弦退火调度器：自动降低学习率，避免后期震荡，保证收敛到最优值
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=int(args.steps), eta_min=1e-6)
@@ -505,28 +569,33 @@ def main() -> None:
                 z_fused_tokens = z_fused_flat.reshape(B, K, -1)
                 
                 # 3. 位置编码+上下文增强：添加空间位置信息 + Transformer空间交互
-                z_fused_tokens = z_fused_tokens.transpose(0, 1)  # 转置为[seq_len, batch, dim]适配PE格式
-                z_fused_tokens = pos_encoder(z_fused_tokens)
-                z_fused_tokens = z_fused_tokens.transpose(0, 1)  # 转回[batch, seq_len, dim]适配Transformer（batch_first=True）
-                z_enhanced = context_encoder(z_fused_tokens)
-                
-                # 4. 全局池化：集合级特征对齐，得到样本级全局特征 [B, D]
-                z_mean = z_enhanced.mean(dim=1)
-                if token_pooler is not None:
-                    z_attn = token_pooler(z_enhanced)
-                    z_final = z_attn
-                    zs_mean = proj_student(z_mean)
-                else:
-                    z_final = z_mean
-                    zs_mean = None
-
-                # 5. Student特征最终投影
+                # ===== 双流分叉：Global(纯pool) + Spatial(残差) =====
+                # Global流：跳过Context，保持与纯pool一致
+                z_global_tokens = z_fused_tokens
+                z_global_mean = z_global_tokens.mean(dim=1)
+                z_final = z_global_mean
+                zs_mean = None
                 zs = proj_student(z_final)
 
-                # 5.1 局部对齐：对token投影后与点云点特征做集合级对齐
+                # Spatial流：进入Context + Residual
+                z_ctx_tokens = z_fused_tokens.transpose(0, 1)
+                z_ctx_tokens = pos_encoder(z_ctx_tokens)
+                z_ctx_tokens = z_ctx_tokens.transpose(0, 1)
+                z_spatial_tokens = context_encoder(z_ctx_tokens)
+                if residual_adapter is not None:
+                    delta = residual_adapter(z_spatial_tokens.reshape(B * K, -1)).reshape(B, K, -1)
+                    z_spatial_tokens = z_spatial_tokens + float(args.residual_alpha) * delta
+
+                # token_pooler只作用于global流（可选）
+                if token_pooler is not None:
+                    z_attn = token_pooler(z_global_tokens)
+                    zs = proj_student(z_attn)
+                    zs_mean = proj_student(z_global_mean)
+
+                # 局部对齐：仅使用spatial分支
                 z_tokens_proj = None
-                if float(args.loss_local) > 0 and "teacher_points" in batch:
-                    z_tokens_proj = proj_student(z_enhanced.reshape(B * K, -1)).reshape(B, K, -1)
+                if (float(args.loss_local) > 0 or float(args.loss_chamfer) > 0) and "teacher_points" in batch:
+                    z_tokens_proj = proj_student(z_spatial_tokens.reshape(B * K, -1)).reshape(B, K, -1)
 
                 # RGB自对比：对每个模型做token均值池化
                 z_rgb_list = [z.mean(dim=1) for z in z_tokens_list]
@@ -594,12 +663,28 @@ def main() -> None:
                 loss_local = local_align_loss(z_tokens_proj, tp, tau=float(args.local_tau))
                 loss = loss + float(args.loss_local) * loss_local
 
+            if float(args.loss_chamfer) > 0 and "teacher_points" in batch and z_tokens_proj is not None:
+                tp = batch["teacher_points"].to(device, non_blocking=True).to(torch.float32)
+                loss_ch = chamfer_loss(
+                    z_tokens_proj,
+                    tp,
+                    max_tokens=int(args.chamfer_max_tokens),
+                    max_points=int(args.chamfer_max_points),
+                    normalize=True,
+                )
+                loss = loss + float(args.loss_chamfer) * loss_ch
+
             # token-attn 与 mean 池化一致性（保持推理接口为mean）
             if float(args.loss_pool) > 0 and zs_mean is not None:
                 loss_pool = F.mse_loss(zs_mean, zs.detach())
                 loss = loss + float(args.loss_pool) * loss_pool
 
         # -------------------------- 梯度累积：损失缩放 --------------------------
+        if not torch.isfinite(loss):
+            if bool(args.skip_nonfinite):
+                opt.zero_grad(set_to_none=True)
+                micro_step += 1
+                continue
         loss_micro = loss / float(accum_steps)
 
         # -------------------------- 相似度指标计算：仅日志展示，无梯度 --------------------------
@@ -640,6 +725,23 @@ def main() -> None:
                     total += float(g.norm(2).cpu().item())**2; cnt +=1
             grad_norm_pre = float(total**0.5) if cnt>0 else None
         except Exception: pass
+
+        # 遇到非有限梯度时先清理，再继续更新（避免完全跳过训练）
+        if nonfinite_grads > 0:
+            try:
+                mods_for_grad = [adapters, fusion, proj_student]
+                if context_encoder is not None:
+                    mods_for_grad.append(context_encoder)
+                if residual_adapter is not None:
+                    mods_for_grad.append(residual_adapter)
+                for mod in mods_for_grad:
+                    for p in mod.parameters():
+                        if p.grad is None:
+                            continue
+                        p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                nonfinite_grads = 0
+            except Exception:
+                pass
 
         # 梯度裁剪：防止梯度爆炸，提升训练稳定性
         if float(args.grad_clip) >0 and nonfinite_grads ==0:
@@ -745,6 +847,8 @@ def main() -> None:
                 ckpt["pos_encoder"] = pos_encoder.state_dict()
             if token_pooler is not None:
                 ckpt["token_pooler"] = token_pooler.state_dict()
+            if residual_adapter is not None:
+                ckpt["residual_adapter"] = residual_adapter.state_dict()
             out = save_dir / f"ckpt_step_{global_step:07d}.pt"
             torch.save(ckpt, out)
             print(f"[ckpt] 保存模型: {out}")
@@ -761,6 +865,8 @@ def main() -> None:
         final_payload["pos_encoder"] = pos_encoder.state_dict()
     if token_pooler is not None:
         final_payload["token_pooler"] = token_pooler.state_dict()
+    if residual_adapter is not None:
+        final_payload["residual_adapter"] = residual_adapter.state_dict()
     torch.save(final_payload, final_ckpt)
     print(f"[ckpt] 训练完成，保存最终模型: {final_ckpt}")
 
