@@ -6,6 +6,7 @@
 2. 提取视觉特征 (4 Models)
 3. 通过对齐模块 (RGB2PC Encoder)
 4. 保存对齐后的特征到Zarr (obs_aligned: [T, 1280])
+5. （可选）保存本体感知 agent_pos 到 Zarr（来自 joint_action/vector）
 """
 import torch
 import torch.nn as nn
@@ -48,11 +49,14 @@ def extract_episode(
     student_tokens: int = 64,
     overwrite: bool = False,
     save_tokens: bool = False,
+    save_proprio: bool = False,
 ):
     """处理单个episode"""
     if output_path.exists() and not overwrite:
         # print(f"Skipping {output_path} (exists)")
         return
+
+    agent_pos = None
     
     with h5py.File(episode_path, 'r') as f:
         # 1. 检查数据
@@ -85,6 +89,28 @@ def extract_episode(
         else:
             print(f"Warning: Action not found in {episode_path}")
             return
+
+        # 读取本体感知（agent_pos / joint state）
+        # 说明：RoboTwin 数据里常用 joint_action/vector 作为 14 维关节状态
+        agent_pos = None
+        if save_proprio:
+            if 'joint_action/vector' in f:
+                agent_pos = f['joint_action/vector'][:]
+            elif 'observation/joint_action/vector' in f:
+                agent_pos = f['observation/joint_action/vector'][:]
+            else:
+                print(f"[Warning] agent_pos not found in {episode_path}, skip saving agent_pos")
+                agent_pos = None
+                save_proprio = False
+
+            if agent_pos is not None:
+                # 对齐长度（防止异常帧数）
+                if agent_pos.shape[0] != num_frames:
+                    min_len = min(agent_pos.shape[0], num_frames)
+                    agent_pos = agent_pos[:min_len]
+                    num_frames = min_len
+                    action = action[:min_len]
+                agent_pos = agent_pos.astype(np.float32)
 
     # 2. 批量提取
     all_aligned_feats = []
@@ -171,10 +197,13 @@ def extract_episode(
             dtype='float32'
         )
     root.create_dataset('action', data=action, chunks=(100, action.shape[1]), dtype='float32')
+    if save_proprio and agent_pos is not None:
+        root.create_dataset('agent_pos', data=agent_pos, chunks=(100, agent_pos.shape[1]), dtype='float32')
     
     # 保存元数据
     root.attrs['task'] = task
     root.attrs['num_frames'] = num_frames
+    root.attrs['has_agent_pos'] = bool(save_proprio and agent_pos is not None)
 
 
 def main():
@@ -192,6 +221,7 @@ def main():
     task_config = config['data'].get('task_config', 'demo_randomized')
     tasks = config['data']['tasks']
     camera_name = config['data']['camera_name']
+    use_proprio = bool(config.get('policy', {}).get('use_proprio', False) or config['data'].get('use_proprio', False))
     
     # 输出目录
     if args.output_dir:
@@ -256,6 +286,7 @@ def main():
                     student_tokens=student_tokens,
                     overwrite=args.overwrite,
                     save_tokens=save_tokens,
+                    save_proprio=use_proprio,
                 )
             except Exception as e:
                 print(f"Error processing {fpath}: {e}")

@@ -77,9 +77,15 @@ def info_nce_batch(z_t: torch.Tensor, z_s: torch.Tensor, *, tau: float = 0.07) -
 
 def local_align_loss(z_tokens: torch.Tensor, t_points: torch.Tensor, *, tau: float = 0.07) -> torch.Tensor:
     """
-    局部对齐损失：token-点云集合级软匹配（无显式对应）。
+    局部对齐“损失/得分”：token-点云集合级软匹配（无显式对应）。
     z_tokens: [B,K,D], t_points: [B,Kt,D]
     目标：每个token至少能“靠近”某个点，每个点也能被某些token覆盖。
+
+    ⚠️ 重要说明（避免误解）：
+    - 本函数返回值通常为 **负数**，因为内部是 `-logsumexp(sim)` 形式（更像“reward”）。
+    - 在训练里我们用 `loss += w_local * local_align_loss(...)`，最小化 total loss 会驱动该项变得更负，
+      等价于让 `logsumexp(sim)` 更大（即 token 与点云更匹配）。
+    - 因此：看到 local≈-16、total loss 变成负数是正常现象，不代表训练坏掉。
     """
     if z_tokens.ndim != 3 or t_points.ndim != 3:
         raise ValueError(f"local_align_loss expects [B,K,D] & [B,Kt,D], got {tuple(z_tokens.shape)} and {tuple(t_points.shape)}")
@@ -401,6 +407,18 @@ def main() -> None:
         seed=int(args.seed),
     )
 
+    # ===================== 4.5 训练目标说明（一次性打印，避免“loss为负”困惑） =====================
+    # local_align_loss 返回负数（-logsumexp），但方向是“越小越好/越负越好”；
+    # total loss 可能为负，这不影响优化与收敛判定。更建议关注 pos/gap、nce、chamfer 等趋势。
+    print(
+        "[loss] total = nce"
+        " + loss_mse*mse"
+        " + loss_rgb*rgb"
+        " + loss_local*local_score(负数, 越负越好)"
+        " + loss_chamfer*chamfer"
+        " + loss_pool*pool"
+    )
+
     # 自动检测teacher特征维度，并自适应调整融合维度，保证维度匹配（核心对齐前提）
     s0 = dataset[0]
     t_dim = 384
@@ -552,7 +570,12 @@ def main() -> None:
                 toks_list[i] = torch.nan_to_num(toks_list[i], nan=0.0, posinf=1e6, neginf=-1e6)
 
         # -------------------------- 前向传播：特征处理+损失计算 --------------------------
+        # loss 组件（仅用于日志展示；不影响梯度）
         loss_rgb_val: float | None = None
+        loss_mse_val: float | None = None
+        loss_local_val: float | None = None
+        loss_chamfer_val: float | None = None
+        loss_pool_val: float | None = None
         with torch.amp.autocast(device_type="cuda", enabled=use_amp):
             if use_token_pool:
                 B, K = toks_list[0].shape[:2]  # B=批次，K=token数量
@@ -640,7 +663,9 @@ def main() -> None:
             
             # 可选MSE损失：辅助对齐，权重为0则关闭
             if float(args.loss_mse) > 0:
-                loss = loss + float(args.loss_mse) * F.mse_loss(F.normalize(zs, dim=-1), F.normalize(zt, dim=-1))
+                loss_mse = F.mse_loss(F.normalize(zs, dim=-1), F.normalize(zt, dim=-1))
+                loss = loss + float(args.loss_mse) * loss_mse
+                loss_mse_val = float(loss_mse.item())
 
             # 可选RGB自对比：保持视觉语义一致性
             if float(args.loss_rgb) > 0:
@@ -662,6 +687,7 @@ def main() -> None:
                 tp = batch["teacher_points"].to(device, non_blocking=True).to(torch.float32)
                 loss_local = local_align_loss(z_tokens_proj, tp, tau=float(args.local_tau))
                 loss = loss + float(args.loss_local) * loss_local
+                loss_local_val = float(loss_local.item())
 
             if float(args.loss_chamfer) > 0 and "teacher_points" in batch and z_tokens_proj is not None:
                 tp = batch["teacher_points"].to(device, non_blocking=True).to(torch.float32)
@@ -673,11 +699,13 @@ def main() -> None:
                     normalize=True,
                 )
                 loss = loss + float(args.loss_chamfer) * loss_ch
+                loss_chamfer_val = float(loss_ch.item())
 
             # token-attn 与 mean 池化一致性（保持推理接口为mean）
             if float(args.loss_pool) > 0 and zs_mean is not None:
                 loss_pool = F.mse_loss(zs_mean, zs.detach())
                 loss = loss + float(args.loss_pool) * loss_pool
+                loss_pool_val = float(loss_pool.item())
 
         # -------------------------- 梯度累积：损失缩放 --------------------------
         if not torch.isfinite(loss):
@@ -806,6 +834,10 @@ def main() -> None:
                     "loss":f"{loss_v_now:.4f}", "ema":f"{ema_loss:.4f}" if ema_loss else "-",
                     "nce":f"{nce_v_now:.4f}", "lr":f"{lr_v_now:.1e}",
                     "gn":f"{grad_norm_post:.2f}" if grad_norm_post else "-",
+                    "mse":f"{loss_mse_val:.3f}" if loss_mse_val is not None else "-",
+                    "rgb":f"{loss_rgb_val:.3f}" if loss_rgb_val is not None else "-",
+                    "loc":f"{loss_local_val:.2f}" if loss_local_val is not None else "-",
+                    "ch":f"{loss_chamfer_val:.3f}" if loss_chamfer_val is not None else "-",
                     "pos":f"{pos_sim:.2f}", "neg":f"{neg_sim:.2f}" if math.isfinite(neg_sim) else "-",
                     "gap":f"{sim_gap:.2f}" if math.isfinite(sim_gap) else "-",
                     "ng":str(nonfinite_grads), "st":"1" if stepped else "0",
@@ -816,8 +848,17 @@ def main() -> None:
         # 终端打印日志
         if stepped and int(args.print_every) >0 and (global_step % int(args.print_every) ==0):
             msg = f"step={global_step} loss={loss_v_now:.4f} ema={ema_loss:.4f} nce={nce_v_now:.4f}"
+            if loss_mse_val is not None:
+                msg += f" mse={loss_mse_val:.4f}"
             if loss_rgb_val is not None:
                 msg += f" rgb={loss_rgb_val:.4f}"
+            if loss_local_val is not None:
+                w_local = float(args.loss_local)
+                msg += f" local={loss_local_val:.2f}(w={w_local:g},c={w_local*loss_local_val:.2f})"
+            if loss_chamfer_val is not None:
+                msg += f" ch={loss_chamfer_val:.4f}"
+            if loss_pool_val is not None:
+                msg += f" pool={loss_pool_val:.4f}"
             msg += f" lr={lr_v_now:.3e} pos={pos_sim:.3f} gap={sim_gap:.3f}"
             if tqdm is not None: tqdm.write(msg)
             else: print(msg)

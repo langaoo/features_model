@@ -1,0 +1,92 @@
+# RGB2PC 对齐训练配置（ws1 + Dual-Stream Token-Full，多任务）
+#
+# 目标：在仅 demo_clean 数据上训练一个更“通用”的 RGB->PC 对齐模块，
+#      使其在多任务上都学到点云空间感知能力（teacher=ULIP point tokens）。
+#
+# ⚠️ 重要约束：
+# - 只能使用 demo_clean（不允许混入 demo_randomized）
+# - ws1 RGB 特征建议外置到外置盘（见 scripts/ws1_external_storage.py）
+
+tasks:
+  # 目录名约定：{task}-{setting}-{num_demos}_sapien_{camera}
+  - lift_pot-demo_clean-50_sapien_head_camera
+  - click_bell-demo_clean-50_sapien_head_camera
+  - move_can_pot-demo_clean-50_sapien_head_camera
+  - handover_block-demo_clean-50_sapien_head_camera
+  - pick_diverse_bottles-demo_clean-50_sapien_head_camera
+  - place_can_basket-demo_clean-50_sapien_head_camera
+  - rotate_qrcode-demo_clean-50_sapien_head_camera
+  - move_pillbottle_pad-demo_clean-50_sapien_head_camera
+
+# episodes=0 表示自动扫描 vis_zarr_roots[0]/task 下的 episode_*.zarr 并取交集
+episodes: 0
+
+# Teacher：ULIP point token（建议也外置；默认按外置盘路径写死，便于复现）
+pc_root: /home/gl/RoboTwin/policy/DP2DP3/features_model/pc_dataset/ulip_point_tokens_zarr
+
+# Student：四模型 ws1 RGB token（通过 features_model/rgb_dataset_ws1 下的软链接指向外置盘）
+vis_zarr_roots:
+  - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_croco_encoder_dict_unified_zarr
+  - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_vggt_encoder_dict_unified_zarr
+  - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_dinov3_encoder_dict_unified_zarr
+  - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_da3_encoder_dict_unified_zarr
+
+# 训练
+device: cuda
+amp: true
+steps: 20000
+batch_size: 32
+grad_accum_steps: 4
+lr: 0.0003
+seed: 0
+tau: 0.07
+num_workers: 8
+
+# 蒸馏目标
+fuse_dim: 1280
+fusion: weighted
+moe_hidden: 1280
+loss_mse: 1.0
+loss_rgb: 0.1
+rgb_tau: 0.07
+
+# 采样
+sample_unit: step
+window_agg: mean
+student_tokens: 1024
+teacher_points: 1024
+student_pool: tokens
+token_pool: attn
+loss_local: 0.1
+local_tau: 0.07
+loss_pool: 0.1
+
+# Residual Adapter + Chamfer（保持与单任务 tokens_full 一致）
+residual_adapter: true
+residual_alpha: 0.3
+residual_zero_init: true
+loss_chamfer: 0.2
+chamfer_max_tokens: 1024
+chamfer_max_points: 1024
+
+# 配对
+strict_pairing: true
+pairing_fallback: error
+skip_nonfinite: true
+
+# 性能/日志
+pack_cache_size: 4
+log_every: 50
+mem_every: 0
+tqdm: true
+
+# wandb
+wandb: false
+wandb_project: rgb2pc_distill
+wandb_entity: ""
+wandb_run_name: ""
+
+# ckpt
+save_dir: /home/gl/RoboTwin/policy/DP2DP3/features_model/outputs/train_rgb2pc_runs/run_ws1_tokens_full_multitask
+save_every: 1000
+

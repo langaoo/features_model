@@ -1,0 +1,58 @@
+# 在线批量特征提取配置（ws1 + pool对齐模块 + 本体感知）
+
+data:
+  robotwin_data_root: /home/gl/RoboTwin/data
+  task_config: demo_clean
+  camera_name: head_camera
+
+  tasks:
+    - lift_pot
+
+  horizon: 8
+  n_obs_steps: 2
+
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: true
+
+encoder:
+  checkpoint: /home/gl/RoboTwin/policy/DP2DP3/features_model/outputs/train_rgb2pc_runs/run_pool_ws1/ckpt_final.pt
+  freeze: true
+
+train:
+  epochs: 500
+  batch_size: 4
+  batch_extract: true
+  lr: 1e-4
+  num_workers: 8
+  optimizer: adamw
+  weight_decay: 1e-6
+
+policy:
+  type: OfficialDP
+  hidden_dim: 512
+  use_official_dp: true
+  num_inference_steps: 100
+  # 本体感知（可开关）
+  use_proprio: true
+  proprio_dim: 14
+  proprio_mode: concat
+  proprio_hidden: 256
+
+device:
+  gpu_ids: [0,1]
+
+output:
+  dir: _runs/online_training_pool_ws1
+  save_every_n_epochs: 50
+  run_name: null
+
+checkpoint:
+  expert_data_num: 50
+  ckpt_setting: demo_clean_pool_ws1_proprio
+  seed: 0
+
+debug:
+  print_config: true
+  fast_dev_run: false

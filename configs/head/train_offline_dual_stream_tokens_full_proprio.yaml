@@ -1,0 +1,63 @@
+# 离线训练配置 - Dual-Stream (全量) + 本体感知
+
+data:
+  features_dataset_dir: /home/gl/RoboTwin/policy/DP2DP3/features_model/data/offline_features_dual_stream_tokens_full_proprio
+
+  horizon: 8
+  n_obs_steps: 2
+  # 关键修复：预测 t+1 动作，避免 agent_pos 与 action 同步导致“抄答案”
+  action_offset: 1
+
+  camera_name: head_camera
+
+  tasks:
+    - lift_pot
+
+  task_config: demo_clean
+
+  use_left_arm: true
+  use_right_arm: true
+  include_gripper: true
+
+encoder:
+  checkpoint: /home/gl/RoboTwin/policy/DP2DP3/features_model/outputs/train_rgb2pc_runs/run_ws1_tokens_full/ckpt_final.pt
+  save_tokens: true
+
+train:
+  epochs: 600
+  batch_size: 32
+  lr: 1e-4
+  num_workers: 4
+  optimizer: adamw
+  weight_decay: 1e-6
+  resume_ckpt: null
+
+policy:
+  type: OfficialDP
+  use_official_dp: true
+  num_inference_steps: 100
+  hidden_dim: 512
+  use_tokens: true
+  token_gate_init: -4.0
+  token_dropout: 0.1
+  ctx_dropout: 0.1
+  # 本体感知（可开关）
+  use_proprio: true
+  proprio_dim: 14
+  proprio_mode: concat
+  proprio_hidden: 256
+
+device:
+  gpu_ids: [0, 1]
+
+output:
+  dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints
+  save_every_n_epochs: 100
+
+checkpoint:
+  expert_data_num: 50
+  ckpt_setting: demo_clean_dual_stream_tokens_full_proprio
+  seed: 0
+
+debug:
+  fast_dev_run: false

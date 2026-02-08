@@ -888,11 +888,6 @@ python tools/offline/train_offline_head.py \
     --config configs/head/train_offline.yaml
 ```
 
-**或使用一键脚本**:
-```bash
-bash scripts/train_offline_pipeline.sh
-```
-
 **预提取数据**:
 ```
 data/offline_features/
@@ -2220,3 +2215,569 @@ policy.normalizer.load_state_dict(ckpt['normalizer'])  # ✅ 加载normalizer
    - LinearNormalizer解决了训练-推理不一致
 
 ---
+
+## 🆕 推理侧：token_full 的“回跳/反复来回”诊断与缓解 (2026-02-04 更新)
+
+> 这一节只针对你现在最关心的现象：**机械臂已经靠近目标后，又突然回到几秒前的位置重新来一遍**（回跳/反复）。  
+> 注意：这和“视频看起来瞬移”是两类问题（下面会区分）。
+
+### A. 现象定义（把你说的“像人眼一样看”量化）
+
+我们用 **右臂 TCP（末端执行器）轨迹**做判断：
+
+- **瞬移候选（teleport candidate）**：相邻两次 policy 执行步之间，TCP 位移突然很大（比如 > 5cm）。
+- **回跳（rewind teleport）**：出现一次“大跳”，并且**落点非常接近几十步之前的位置**（例如 10~80 步内，距离 < 2cm）。
+
+这类回跳很像“计划突然改主意，回到之前的姿态重新走一遍”，是你视频里反复来回的主要来源。
+
+### B. 为什么 token_full 更容易回跳，而 pool_ws1 更稳定？
+
+通俗解释：
+
+1) **Diffusion Head 本质是“随机采样一条未来轨迹”**  
+token_full 这条路线在每次重规划时会从随机噪声采样一条 `horizon=8` 的动作序列，然后只执行前 `n_action_exec=4` 步，再重规划。  
+如果两次重规划采样到了不同的“行为模式”（比如这次决定“靠近 pot”，下次决定“撤退/回到预抓取姿态”），就会出现回跳。
+
+2) **token_full 的条件输入更“敏感”**  
+token_full 输入的是大量 patch token（空间信息更细），对环境里小变化（视角、遮挡、光照、物体边缘）更敏感；再叠加 diffusion 的随机性，就更容易在重规划边界发生“模式切换”。
+
+3) **pool_ws1 的条件输入更“粗、稳”**  
+pool_ws1 只看 pooled 全局向量，很多细节变化会被平均掉，因此相邻两次重规划得到的条件更稳定，采样出来的轨迹更一致，回跳概率更低。
+
+#### B2. 从 DP 原理再讲一遍（更直白）
+
+把 DP 想成“每次都重新 **随机画一条未来轨迹**”的模型：
+
+- **DP 不是输出 1 个动作，而是采样一段未来动作**（比如 8 步）。  
+- 每次重规划时，它会 **重新从噪声采样** 一条新的 8 步轨迹。  
+- 它**不会强制**这条新轨迹与上一条轨迹的后半段一致。  
+
+所以：  
+当你只执行前 `n_action_exec` 步，再重规划时，如果新计划“换了一个模式”，就会看起来**突然改主意、回到之前位置再来一次**。  
+
+**“模式切换”= 轨迹类型切换**（例如“直接靠近抓取” ↔ “先后退再调整”）。  
+token_full 更容易出现这种切换，因为它对细节变化更敏感，采样分布更“散”；  
+pool_ws1 更像“只看大概形状”，分布更集中，连续两次采样更一致。
+
+> 重要澄清：  
+> “闪现”并不一定是数据切片错位造成的。  
+> 在你当前离线 head 的数据切片中，action 是从当前帧开始（没有跳到未来多步）。  
+> 所以如果仍然有“回跳”，更可能是 **RHC 重规划 + token_full 高敏感 + 采样随机性** 叠加的结果。
+
+### C. 这是不是“结构决定的、真机一定废了”？
+
+不是。需要区分两件事：
+
+1) **“视频看起来瞬移”**：很大一部分来自录像采样稀疏（仿真 `take_action()` 内部会用高频控制执行一段平滑轨迹，但视频可能每次只写 1 帧）。  
+真实机械臂不可能瞬移，它会以速度/加速度限制连续运动。
+
+2) **“回跳/反复来回”**：这是策略在重规划边界输出的**目标关节/目标轨迹发生了大幅反向变化**。  
+真机上不会瞬移，但会表现为：突然反向、抖动、反复靠近/远离，甚至不安全。  
+所以：**如果不解决回跳，确实不建议直接上真机。**
+
+### D. 诊断工具（推荐你以后都用这套来“量化像人眼一样的感受”）
+
+1) 生成 action/TCP 日志（JSONL）
+```bash
+export CUDA_VISIBLE_DEVICES=0,1
+/home/gl/miniconda3/envs/RoboTwin/bin/python script/eval_policy.py \
+  --config policy/DP2DP3/deploy_policy.yml --overrides \
+  --task_name lift_pot --task_config demo_clean \
+  --ckpt_setting demo_clean_dual_stream_tokens_full \
+  --expert_data_num 50 --seed 0 --policy_name DP2DP3 \
+  --checkpoint_num 600 --gpu_id 0 --n_action_exec 4 --gpu_ids "[0,1]" \
+  --eval_test_num 1 \
+  --action_log_path policy/DP2DP3/logs/action_logs/repro_baseline_ckpt600_k4.jsonl
+```
+
+2) 统计“回跳计数/大跳变”等指标（按 episode）
+```bash
+/home/gl/miniconda3/envs/RoboTwin/bin/python policy/DP2DP3/analyze_action_log.py \
+  --log policy/DP2DP3/logs/action_logs/repro_baseline_ckpt600_k4.jsonl \
+  --episode 0 \
+  --out policy/DP2DP3/logs/action_logs/repro_baseline_ckpt600_k4_summary.json
+```
+
+3) 画 TCP 轨迹与单步位移曲线（最直观）
+```bash
+/home/gl/miniconda3/envs/RoboTwin/bin/python policy/DP2DP3/plot_trajectory_compare.py \
+  --log_a policy/DP2DP3/logs/action_logs/repro_baseline_ckpt600_k4.jsonl --name_a baseline \
+  --log_b policy/DP2DP3/logs/action_logs/repro_baseline_ckpt600_k4.jsonl --name_b baseline \
+  --arm right --episode 0 \
+  --out_dir policy/DP2DP3/logs/trajectory_plots/repro_baseline
+```
+
+### E. 推理侧缓解方案（不改训练/不改 checkpoint）：Best-of-N 计划选择
+
+核心思想：**一次重规划不只采样 1 条未来 8 步轨迹，而是采样 N 条候选轨迹，选与“上一段剩余动作”最一致的那条**，从而显著减少回跳。
+
+启用方式（推荐 N=4；默认关闭，不影响你的 81% baseline）：
+```bash
+export CUDA_VISIBLE_DEVICES=0,1
+export DP2DP3_PLAN_SELECT_N=4   # ✅ 关键开关：Best-of-N 计划选择（默认=1，不影响baseline）
+export ROBOTWIN_EVAL_VIDEO_DENSE=1
+export ROBOTWIN_EVAL_VIDEO_DENSE_INTERVAL=25
+
+/home/gl/miniconda3/envs/RoboTwin/bin/python script/eval_policy.py \
+  --config policy/DP2DP3/deploy_policy.yml --overrides \
+  --task_name lift_pot --task_config demo_clean \
+  --ckpt_setting demo_clean_dual_stream_tokens_full \
+  --expert_data_num 50 --seed 0 --policy_name DP2DP3 \
+  --checkpoint_num 600 --gpu_id 0 --n_action_exec 4 --gpu_ids "[0,1]" \
+  --eval_test_num 1 \
+  --action_log_path policy/DP2DP3/logs/action_logs/repro_planselect4_ckpt600_k4.jsonl
+```
+
+实践结论（以 lift_pot / ckpt600 / seed=0 / episode0 为例）：
+- baseline：`rewind_teleports = 2`
+- `plan_select_n=4`：`rewind_teleports = 0`
+
+代价：推理会变慢（每次重规划多采样 N 次）。
+
+### F. “密集写帧”只影响录像，不影响策略（安全说明）
+
+为了解决“视频看起来瞬移”，我们加了可选开关（默认关闭，不影响任何任务/策略）：
+```bash
+export ROBOTWIN_EVAL_VIDEO_DENSE=1
+export ROBOTWIN_EVAL_VIDEO_DENSE_INTERVAL=25   # 250Hz/25≈10fps
+```
+不开启时行为与原版完全一致。
+
+---
+
+## 🆕 多任务 ws1 外置特征 → 对齐训练 → Head训练 → 评估（完整可复现流水线）(2026-02-05 更新)
+
+这一节对应你的“终极 prompt”要求：**不破坏 lift_pot/ckpt600 的 81% baseline**，同时把多任务 ws1 特征全部外置到磁盘，跑通 **数据准备→RGB特征(ws1)→ULIP teacher→对齐训练→离线特征→Head训练→推理评估+回跳指标** 的闭环。
+
+> ✅ 原则：所有新增功能默认关闭，不影响 baseline；主要通过 **新脚本/新配置**实现。
+
+### 0) 前置条件：外置盘挂载与权限
+
+外置盘目标路径（写死，便于复现）：
+```
+/media/gl/新加卷/gllll/features_model_ws1
+```
+
+必须满足：
+- 路径存在（已挂载）
+- 当前用户对该目录可写
+
+检查命令（任意一条失败都需要先修权限/挂载）：
+```bash
+ls -la /media/gl/新加卷/gllll/features_model_ws1
+touch /media/gl/新加卷/gllll/features_model_ws1/.__write_test && rm /media/gl/新加卷/gllll/features_model_ws1/.__write_test
+```
+
+### 1) 手动逐步跑（按你给的命令严格整理）
+
+下面每一步都把路径写死，并建议你把 stdout/stderr 用 `tee` 落盘。
+
+#### Step0：收集用于对齐训练的 8 个数据集（demo_clean）
+
+> 只允许 demo_clean；**不混入 demo_randomized**。  
+> 下面保留你给的写法（第 4 个参数脚本会忽略，但不会报错）。
+
+```bash
+cd /home/gl/RoboTwin
+for t in handover_block click_bell move_can_pot pick_diverse_bottles place_can_basket rotate_qrcode move_pillbottle_pad lift_pot; do \
+  bash collect_data.sh ${t} demo_clean demo_clean 0; \
+done
+```
+
+#### Step1：从 RoboTwin HDF5 生成 RGB_ORI / PC_ORI（demo_clean only）
+
+任务候选（你给的 8 个，我直接全选；你也可以删减到 5~10 个）：
+```
+handover_block, click_bell, move_can_pot, pick_diverse_bottles,
+place_can_basket, rotate_qrcode, move_pillbottle_pad, lift_pot
+```
+
+```bash
+conda activate DP3_ULIP
+cd /home/gl/RoboTwin/policy/DP2DP3/features_model && \
+for t in handover_block click_bell move_can_pot pick_diverse_bottles place_can_basket rotate_qrcode move_pillbottle_pad lift_pot; do \
+    echo "=== 正在处理任务: $t ==="; \
+    python tools/dataset/process_sapien_pcd.py ${t} demo_clean 50 --output_root /home/gl/RoboTwin/policy/DP2DP3/features_model --camera head_camera; \
+done
+```
+
+输出示例：
+```
+rgb_dataset/RGB_ORI/lift_pot-demo_clean-50_sapien_head_camera/episode_0/step_0000.png
+pc_dataset/PC_ORI/lift_pot-demo_clean-50_sapien_head_camera/episode_0/step_0000.ply
+```
+
+#### Step2：提取 ws1 RGB 特征（写到外置盘）
+
+```bash
+cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+for m in croco vggt dinov3 da3; do
+  /home/gl/miniconda3/envs/depth3/bin/python tools/features/run_extract_features.py \
+    --model ${m} \
+    --rgb_root /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset/RGB_ORI \
+    --out_root /media/gl/新加卷/gllll/rgb_dataset_ws1 \
+    --window_size 1 --stride 1 --device cuda
+done
+
+# 建立软链接（让对齐/训练脚本仍能按老路径读到）
+ln -s /media/gl/新加卷/gllll/rgb_dataset_ws1/ /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1
+```
+
+输出路径（实际写入外置盘）：
+```
+rgb_dataset_ws1/features_dinov3_encoder_dict_unified_zarr/<task-demo_clean-50_sapien_head_camera>/episode_0.zarr
+```
+
+#### Step3：提取 ULIP teacher（point tokens，建议也外置）
+
+> token_full 对齐用的是 **ULIP 局部 token**，不是 pooled 的全局向量。
+
+```bash
+cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+/home/gl/miniconda3/envs/DP3_ULIP/bin/python tools/features/extract_ulip_point_tokens_to_zarr.py \
+  --output_dir /media/gl/新加卷/gllll/pc_dataset/ulip_point_tokens_zarr
+
+# 建立软链接
+ln -s /media/gl/新加卷/gllll/pc_dataset/ulip_point_tokens_zarr/ /home/gl/RoboTwin/policy/DP2DP3/features_model/pc_dataset/ulip_point_tokens_zarr
+```
+
+输出路径：
+``` 
+/media/gl/新加卷/gllll/pc_dataset/ulip_point_tokens_zarr/<task-demo_clean-50_sapien_head_camera>/episode_0/step_0000.ply.ulip_tokens.zarr
+```
+
+#### Step4：对齐训练（多任务 tokens_full）
+
+```bash
+cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+/home/gl/miniconda3/envs/depth3/bin/python tools/alignment/train_rgb2pc_distill.py \
+  --config configs/alignment/train_rgb2pc_distill_ws1_tokens_full_multitask.yaml
+```
+
+输出 checkpoint：
+```
+outputs/train_rgb2pc_runs/run_ws1_tokens_full_multitask/ckpt_final.pt
+```
+
+#### Step5：离线提取对齐后的观测特征（多任务）
+
+```bash
+cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+/home/gl/miniconda3/envs/depth3/bin/python tools/offline/extract_offline_features.py \
+  --config configs/head/train_online_batch_extract_dual_stream_tokens_full_multitask.yaml \
+  --output_dir /media/gl/新加卷/gllll/features_model_ws1/offline_features_dual_stream_tokens_full_multitask \
+  --overwrite
+```
+
+输出（每个 episode 一个 zarr）：
+```
+/media/gl/新加卷/gllll/features_model_ws1/offline_features_dual_stream_tokens_full_multitask/lift_pot/episode0.zarr
+  ├── obs_aligned: [T, 1280]
+  ├── obs_tokens:  [T, K, 1280]
+  └── action:      [T, 14]
+```
+
+#### Step6：离线训练 Head（多任务）
+
+```bash
+cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+/home/gl/miniconda3/envs/depth3/bin/python tools/offline/train_offline_head.py \
+  --config configs/head/train_offline_dual_stream_tokens_full_multitask.yaml
+```
+
+输出：
+```
+/home/gl/RoboTwin/policy/DP2DP3/checkpoints/<task-config-seed>/best.ckpt
+```
+
+#### Step7：推理评估（RoboTwin）+ 回跳指标（动作/TCP）
+
+```bash
+cd /home/gl/RoboTwin
+
+export PYTHON_BIN=/home/gl/miniconda3/envs/RoboTwin/bin/python
+export DP2DP3_ACTION_LOG_PATH=policy/DP2DP3/logs/action_logs/eval100_mt.jsonl
+
+# ✅ 缓解回跳（默认关闭不影响 baseline）
+export DP2DP3_PLAN_SELECT_N=4
+
+bash policy/DP2DP3/eval.sh lift_pot demo_clean demo_clean_dual_stream_tokens_full 50 0 "0,1" 600 4 100
+```
+
+评估视频输出目录（脚本会自动创建）：
+```
+eval_result/lift_pot/DP2DP3/demo_clean/demo_clean_dual_stream_tokens_full/<时间戳>/episode*.mp4
+```
+
+统计 “TCP 回跳/瞬移候选” 指标：
+```bash
+cd /home/gl/RoboTwin
+/home/gl/miniconda3/envs/RoboTwin/bin/python policy/DP2DP3/analyze_tcp_rewind.py \
+  --log policy/DP2DP3/logs/action_logs/eval100_mt.jsonl \
+  --out policy/DP2DP3/logs/action_logs/eval100_mt_tcp_summary.json
+
+# 更严格：只算 >10cm 的严重大跳
+/home/gl/miniconda3/envs/RoboTwin/bin/python policy/DP2DP3/analyze_tcp_rewind.py \
+  --log policy/DP2DP3/logs/action_logs/eval100_mt.jsonl \
+  --teleport_thresh 0.1 \
+  --out policy/DP2DP3/logs/action_logs/eval100_mt_tcp_summary_thr0p1.json
+```
+
+可视化某个 episode 的 TCP 轨迹与单步位移：
+```bash
+/home/gl/miniconda3/envs/RoboTwin/bin/python policy/DP2DP3/plot_trajectory_compare.py \
+  --log_a policy/DP2DP3/logs/action_logs/eval100_mt.jsonl --name_a plan4 \
+  --log_b policy/DP2DP3/logs/action_logs/eval100_mt.jsonl --name_b plan4 \
+  --arm right --episode 0 \
+  --out_dir policy/DP2DP3/logs/trajectory_plots/eval100_mt
+```
+
+### 3) 新增/修改文件清单（不会影响 baseline 的默认行为）
+
+**features_model（训练侧）新增：**
+- `configs/alignment/train_rgb2pc_distill_ws1_tokens_full_multitask.yaml`
+- `configs/head/train_online_batch_extract_dual_stream_tokens_full_multitask.yaml`
+- `configs/head/train_offline_dual_stream_tokens_full_multitask.yaml`
+- `configs/head/train_online_batch_extract_dual_stream_tokens_full_train.yaml`
+- `configs/head/train_offline_dual_stream_tokens_full_train.yaml`
+
+**DP2DP3（推理/评估侧）新增/修改：**
+- `policy/DP2DP3/deploy_policy.py`：加入 `DP2DP3_PLAN_SELECT_N` 等开关（默认=1不变）；修复 plan_select tail_fallback 拼接断点导致的回跳放大。
+- `policy/DP2DP3/eval.sh`：支持 `PYTHON_BIN` 与 `DP2DP3_ACTION_LOG_PATH`（不设置则与 baseline 行为一致）。
+- `policy/DP2DP3/analyze_tcp_rewind.py`：新增批量 “回跳/瞬移候选” 指标统计（只读日志，不影响推理）。
+- `policy/DP2DP3/plot_trajectory_compare.py`、`policy/DP2DP3/analyze_action_log.py`：新增可视化/统计工具（只读日志）。
+- `script/eval_policy.py`：允许通过 overrides 覆盖 `eval_video_log`（不传则不变）。
+- `envs/_base_task.py`：新增 `ROBOTWIN_EVAL_VIDEO_DENSE`（默认关闭，仅影响录像，不影响策略）。
+
+---
+
+## 🆕 FAQ：对齐训练里为什么会出现“loss 变成负数”？这是错的吗？(2026-02-06 更新)
+
+不是错，属于**正常现象**（尤其是 `tokens_full` + `loss_local>0` 时）。
+
+先把你看到的日志拆开看（以你 step=1000 的一行举例）：
+
+- `nce=0.7831`：全局 InfoNCE（交叉熵），一定是正数。
+- `mse≈0.0008`：MSE（很小，正常）。
+- `rgb≈0.6502`：RGB 自对比（正数）。
+- `local≈-16.86`：**注意这里是负数**，但这是我们故意这样定义的（见下）。
+- `ch≈0.6783`：Chamfer（正数）。
+- `pool≈0.1280`：pool 一致性（正数）。
+
+你当前配置（`configs/alignment/train_rgb2pc_distill_ws1_tokens_full_multitask.yaml`）的总损失是：
+
+```
+total = nce
+      + 1.0 * mse
+      + 0.1 * rgb
+      + 0.1 * local_score      # local_score 本身就是负数，越负越好
+      + 0.2 * chamfer
+      + 0.1 * pool
+```
+
+其中 `local_score` 在代码里是这样写的（软匹配，集合级别，无显式对应）：
+
+- `sim = cos(token, point) / tau`
+- `tok_to_pt = logsumexp(sim)`，`pt_to_tok = logsumexp(sim)`
+- `local_score = -0.5 * (mean(tok_to_pt) + mean(pt_to_tok))`
+
+所以它天然就是负数（因为前面有个负号），并且：
+
+- **local_score 越负**  ⇔  `logsumexp(sim)` 越大  ⇔  token 更“贴近”某些点云 token（匹配更强）
+- 训练时我们做的是 **最小化 total**，因此会把 `local_score` 推得更负
+- 于是 total 被 `0.1*local_score` 拉成负数，是完全正常的
+
+更通俗一点：这项更像“奖励（reward）”，但我们写成了 loss 形式（带负号）来最小化，所以你会看到负数。
+
+你判断“训练是否正常”不要看 total 的正负，而要看趋势：
+- `pos` 在变大、`gap` 在变大（正负样本分离更强）；
+- `nce` 大体在下降；
+- `chamfer` 不爆炸、不 NaN；
+-（最关键）下游 head 训练/推理 success 是否提升。
+
+对应代码位置：
+- `policy/DP2DP3/features_model/tools/alignment/train_rgb2pc_distill.py:78`（`local_align_loss` 定义）
+- `policy/DP2DP3/features_model/tools/alignment/train_rgb2pc_distill.py:670`（`loss += loss_local * local_score`）
+
+---
+
+## 🆕 单任务：复用“多任务对齐模块”训练新任务 Head（无需点云）(2026-02-06 更新)
+
+这一节把你关心的 **place_a2b_left** 完整闭环整理成「可直接跑的」步骤。  
+你当前已完成 **Step1–Step5（多任务对齐模块训练到 ckpt_step_0015000.pt）**，下面从 **新任务数据**开始。
+
+核心结论（先说清楚）：
+- **对齐模块（encoder）**：多任务训练得到通用 RGB→PC 表征映射（需要点云 teacher）。
+- **动作头（head）**：**单任务训练即可**，且 **不需要点云**（只用 RGB + action）。
+
+### Step6：采集新任务数据（demo_clean）
+
+```bash
+cd /home/gl/RoboTwin
+export PYTHON_BIN=/home/gl/miniconda3/envs/RoboTwin/bin/python
+bash collect_data.sh place_a2b_left demo_clean 0
+```
+
+采集产物（HDF5）：
+```
+/home/gl/RoboTwin/data/place_a2b_left/demo_clean/data/episode0.hdf5
+```
+
+### Step7（可选）：把 RGB 图像落盘（便于肉眼检查）
+
+> **说明**：后续的离线特征提取是 **直接从 HDF5 读 RGB**，因此这一招只是“辅助检查”，不是必需。
+
+```bash
+cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+# 这里的 50 请替换为你实际收集的 episode 数
+/home/gl/miniconda3/envs/depth3/bin/python tools/dataset/process_sapien_rgb.py \
+  place_a2b_left demo_clean 50 \
+  --camera head_camera \
+  --rgb_dirname RGB_TRAIN
+```
+
+输出示例：
+```
+rgb_dataset/RGB_TRAIN/place_a2b_left-demo_clean-50_sapien_head_camera/episode_0/step_0000.png
+```
+
+### Step8：离线提取“对齐后的观测特征”（复用多任务对齐模块）
+
+使用新配置文件：  
+`configs/head/train_online_batch_extract_dual_stream_tokens_full_train.yaml`  
+（已指向你训练好的 `ckpt_step_0015000.pt`，如需换 ckpt 请改这里）
+
+```bash
+cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+/home/gl/miniconda3/envs/depth3/bin/python tools/offline/extract_offline_features.py \
+  --config configs/head/train_online_batch_extract_dual_stream_tokens_full_train.yaml \
+  --output_dir /home/gl/RoboTwin/policy/DP2DP3/features_model/data/offline_features_train \
+  --overwrite
+```
+
+输出（每个 episode 一个 zarr）：
+```
+/home/gl/RoboTwin/policy/DP2DP3/features_model/data/offline_features_train/place_a2b_left/episode0.zarr
+  ├── obs_aligned: [T, 1280]
+  ├── obs_tokens:  [T, K, 1280]
+  └── action:      [T, 14]
+```
+
+### Step9：离线训练 Head（单任务，600 epochs）
+
+配置文件：  
+`configs/head/train_offline_dual_stream_tokens_full_train.yaml`
+
+> ⚠️ 如果你收集的 demo 数量不是 50，请同步修改该配置里的  
+> `checkpoint.expert_data_num`（否则 eval 路径会不匹配）。
+
+```bash
+cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+/home/gl/miniconda3/envs/depth3/bin/python tools/offline/train_offline_head.py \
+  --config configs/head/train_offline_dual_stream_tokens_full_train.yaml
+```
+
+输出（单独存放到 checkpoints_train）：
+```
+/home/gl/RoboTwin/policy/DP2DP3/checkpoints_train/place_a2b_left-demo_clean_train_mtenc-50-0/600.ckpt
+```
+
+> ⚠️ **评估脚本默认只会在 `policy/DP2DP3/checkpoints/` 下找 ckpt**。  
+> 如果你坚持“单独目录”，请建立一个软链接以保持 eval 命令不变：
+
+```bash
+ln -sfn /home/gl/RoboTwin/policy/DP2DP3/checkpoints_train/place_a2b_left-demo_clean_train_mtenc-50-0 \
+        /home/gl/RoboTwin/policy/DP2DP3/checkpoints/place_a2b_left-demo_clean_train_mtenc-50-0
+```
+
+### Step10：推理评估（RoboTwin）+ 成功率
+
+```bash
+cd /home/gl/RoboTwin
+export PYTHON_BIN=/home/gl/miniconda3/envs/RoboTwin/bin/python
+
+# （可选）输出动作/TCP日志，方便“像人眼一样”量化回跳
+export DP2DP3_ACTION_LOG_PATH=policy/DP2DP3/logs/action_logs/place_a2b_left_eval100.jsonl
+
+# （可选）缓解 token_full 回跳（默认关闭，不影响 baseline）
+export DP2DP3_PLAN_SELECT_N=4
+
+# 评估 100 条（600.ckpt）
+bash policy/DP2DP3/eval.sh \
+  place_a2b_left demo_clean demo_clean_train_mtenc \
+  50 0 "0,1" 600 4 100   # 这里的 50 同样要与实际 demo 数一致
+```
+
+评估结束后成功率在 `_result.txt`：
+```
+eval_result/place_a2b_left/DP2DP3/demo_clean/demo_clean_train_mtenc/<时间戳>/_result.txt
+```
+
+如需统计回跳指标：
+```bash
+/home/gl/miniconda3/envs/RoboTwin/bin/python policy/DP2DP3/analyze_tcp_rewind.py \
+  --log policy/DP2DP3/logs/action_logs/place_a2b_left_eval100.jsonl \
+  --out policy/DP2DP3/logs/action_logs/place_a2b_left_eval100_tcp_summary.json
+```
+
+> 如果仍偶发 `cannot create buffer`，先确认 GPU 显存是否被其它训练占用；必要时重启渲染进程或降低并发进程数。
+
+---
+
+## 🆕 本体感知可选模块（不破坏纯视觉）
+
+**核心原则：**  
+视觉对齐 Encoder 完全不改，仍是纯视觉；  
+本体感知（agent_pos）只在 **Head 前融合**，通过配置开关控制，默认关闭。
+
+### 1) 离线特征提取（保存 agent_pos）
+
+使用**新脚本**（不影响旧流程）：
+```bash
+cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+/home/gl/miniconda3/envs/depth3/bin/python tools/offline_proprio/extract_offline_features_proprio.py \
+  --config configs/head/train_online_batch_extract_dual_stream_tokens_full_proprio.yaml \
+  --output_dir /home/gl/RoboTwin/policy/DP2DP3/features_model/data/offline_features_dual_stream_tokens_full_proprio \
+  --overwrite
+```
+
+输出 Zarr 将额外包含：
+```
+agent_pos: [T, 14]   # 来自 HDF5 的 joint_action/vector
+```
+
+> 说明：当前 RoboTwin HDF5 中没有显式 qpos 字段，因此用 `joint_action/vector` 作为 agent_pos 代理。  
+> 这与环境 observation 的 `joint_action.vector` 一致，能提供“手在哪”的信息。
+
+### 2) 离线训练 Head（融合 proprio）
+
+```bash
+cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+/home/gl/miniconda3/envs/depth3/bin/python tools/offline_proprio/train_offline_head_proprio.py \
+  --config configs/head/train_offline_dual_stream_tokens_full_proprio.yaml
+```
+
+关键配置（可开关）：
+```yaml
+policy:
+  use_proprio: true        # 关闭即可回退到纯视觉
+  proprio_dim: 14
+  proprio_mode: concat     # concat 或 add
+  proprio_hidden: 256
+```
+
+### 3) 推理部署（保持兼容，按配置启用）
+
+启用 proprio 的配置文件：
+```
+policy/DP2DP3/deploy_policy_proprio.yml
+```
+
+执行：
+```bash
+export DP2DP3_DEPLOY_CONFIG=policy/DP2DP3/deploy_policy_proprio.yml
+bash policy/DP2DP3/eval.sh lift_pot demo_clean demo_clean_dual_stream_tokens_full_proprio 50 0 "0,1" 600 4 100
+```
+
+**回退到纯视觉：**  
+只需删除 `DP2DP3_DEPLOY_CONFIG` 或改回 `use_proprio: false`，旧 ckpt 与旧流程完全不受影响。
