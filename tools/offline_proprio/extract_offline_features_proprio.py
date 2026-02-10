@@ -91,25 +91,32 @@ def extract_episode(
             return
 
         # 读取本体感知（agent_pos / joint state）
-        # 说明：RoboTwin 数据里常用 joint_action/vector 作为 14 维关节状态
+        # ⚠️ 关键修复: agent_pos 和 action 需要时间偏移
+        # 原版DP: state[t] = vector[t], action[t] = vector[t+1]
+        # 所以这里: agent_pos = vector[:-1], action = vector[1:]
         agent_pos = None
         if save_proprio:
             if 'joint_action/vector' in f:
-                agent_pos = f['joint_action/vector'][:]
+                vector_all = f['joint_action/vector'][:]
+                # agent_pos 取 0 到 T-2 帧 (当前状态)
+                agent_pos = vector_all[:-1]
+                # action 取 1 到 T-1 帧 (下一步动作)
+                action = vector_all[1:]
+                # 同步调整 num_frames
+                num_frames = len(agent_pos)
+                print(f"[INFO] Using time-shifted agent_pos: {num_frames} frames")
             elif 'observation/joint_action/vector' in f:
-                agent_pos = f['observation/joint_action/vector'][:]
+                vector_all = f['observation/joint_action/vector'][:]
+                agent_pos = vector_all[:-1]
+                action = vector_all[1:]
+                num_frames = len(agent_pos)
+                print(f"[INFO] Using time-shifted agent_pos: {num_frames} frames")
             else:
                 print(f"[Warning] agent_pos not found in {episode_path}, skip saving agent_pos")
                 agent_pos = None
                 save_proprio = False
 
             if agent_pos is not None:
-                # 对齐长度（防止异常帧数）
-                if agent_pos.shape[0] != num_frames:
-                    min_len = min(agent_pos.shape[0], num_frames)
-                    agent_pos = agent_pos[:min_len]
-                    num_frames = min_len
-                    action = action[:min_len]
                 agent_pos = agent_pos.astype(np.float32)
 
     # 2. 批量提取

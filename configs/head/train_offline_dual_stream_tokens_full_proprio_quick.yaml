@@ -5,8 +5,9 @@ data:
 
   horizon: 8
   n_obs_steps: 2
-  # 关键修复：预测 t+1 动作，避免 agent_pos 与 action 同步导致“抄答案”
-  action_offset: 1
+  # 数据提取已做时间偏移（agent_pos=vector[t], action=vector[t+1]）
+  # 所以这里 action_offset 设为 0，避免双重偏移
+  action_offset: 0
 
   camera_name: head_camera
 
@@ -45,6 +46,9 @@ policy:
   proprio_dim: 14
   proprio_mode: concat
   proprio_hidden: 256
+  # 抑制 proprio 过强带来的“抄答案/忽视视觉”
+  proprio_dropout: 0.2
+  proprio_scale: 0.5
 
 device:
   gpu_ids: [0, 1]

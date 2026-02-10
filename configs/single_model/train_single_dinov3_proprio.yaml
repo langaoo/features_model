@@ -1,0 +1,37 @@
+# 单模型 DINOv3 + proprio 训练配置
+# 目的: 验证本体感知(agent_pos)是否能提升单模型性能
+# 与 train_single_dinov3.yaml 的区别: 新增 agent_pos 直接拼接
+
+data:
+  robotwin_data_root: /home/gl/RoboTwin/data
+  task_name: lift_pot
+  task_config: demo_clean
+  camera_name: head_camera
+  expert_data_num: 50
+  
+  # DINOv3 离线特征路径
+  vis_zarr_root: /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_dinov3_encoder_dict_unified_zarr
+  
+  # 数据采样（与DP原版 robot_dp_14.yaml 对齐）
+  horizon: 8
+  n_obs_steps: 3
+
+model:
+  name: dinov3
+
+policy:
+  num_inference_steps: 100
+
+train:
+  epochs: 600
+  batch_size: 32
+  lr: 0.0001
+  weight_decay: 0.000001
+  num_workers: 4
+
+device:
+  gpu_id: 0
+
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_single_model_ws1/lift_pot-demo_clean-50-dinov3-proprio
+  save_every: 100

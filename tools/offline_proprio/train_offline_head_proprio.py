@@ -55,6 +55,8 @@ class DPRGBPolicy(nn.Module):
         proprio_dim: int = 14,
         proprio_mode: str = "concat",
         proprio_hidden: int = 256,
+        proprio_dropout: float = 0.0,
+        proprio_scale: float = 1.0,
     ):
         super().__init__()
         if not HAS_OFFICIAL_DP:
@@ -65,6 +67,7 @@ class DPRGBPolicy(nn.Module):
         
         self.use_proprio = bool(use_proprio)
         self.proprio_mode = str(proprio_mode)
+        self.proprio_scale = float(proprio_scale)
 
         self.obs_encoder = nn.Sequential(
             nn.Linear(obs_dim, 512),
@@ -73,6 +76,7 @@ class DPRGBPolicy(nn.Module):
             nn.ReLU(),
         )
         if self.use_proprio:
+            self.proprio_dropout = nn.Dropout(float(proprio_dropout)) if float(proprio_dropout) > 0 else nn.Identity()
             self.proprio_encoder = nn.Sequential(
                 nn.Linear(int(proprio_dim) * int(n_obs_steps), proprio_hidden),
                 nn.ReLU(),
@@ -131,6 +135,10 @@ class DPRGBPolicy(nn.Module):
                 agent_pos = self.normalizer["agent_pos"].normalize(agent_pos).to(device)
             proprio_flat = agent_pos.reshape(B, -1)
             proprio_cond = self.proprio_encoder(proprio_flat)
+            if hasattr(self, "proprio_dropout"):
+                proprio_cond = self.proprio_dropout(proprio_cond)
+            if self.proprio_scale != 1.0:
+                proprio_cond = proprio_cond * self.proprio_scale
             if self.proprio_mode == "add":
                 obs_cond = obs_cond + proprio_cond
             else:
@@ -160,6 +168,8 @@ class DPRGBDualStreamPolicy(nn.Module):
         proprio_dim: int = 14,
         proprio_mode: str = "concat",
         proprio_hidden: int = 256,
+        proprio_dropout: float = 0.0,
+        proprio_scale: float = 1.0,
     ):
         super().__init__()
         if not HAS_OFFICIAL_DP:
@@ -168,6 +178,7 @@ class DPRGBDualStreamPolicy(nn.Module):
         self.normalizer = LinearNormalizer()
         self.use_proprio = bool(use_proprio)
         self.proprio_mode = str(proprio_mode)
+        self.proprio_scale = float(proprio_scale)
         self.obs_encoder = nn.Sequential(
             nn.Linear(obs_dim, 512),
             nn.ReLU(),
@@ -175,6 +186,7 @@ class DPRGBDualStreamPolicy(nn.Module):
             nn.ReLU(),
         )
         if self.use_proprio:
+            self.proprio_dropout = nn.Dropout(float(proprio_dropout)) if float(proprio_dropout) > 0 else nn.Identity()
             self.proprio_encoder = nn.Sequential(
                 nn.Linear(int(proprio_dim) * int(n_obs_steps), proprio_hidden),
                 nn.ReLU(),
@@ -237,6 +249,10 @@ class DPRGBDualStreamPolicy(nn.Module):
                 agent_pos = self.normalizer["agent_pos"].normalize(agent_pos).to(obs_global.device)
             proprio_flat = agent_pos.reshape(B, -1)
             proprio_cond = self.proprio_encoder(proprio_flat)
+            if hasattr(self, "proprio_dropout"):
+                proprio_cond = self.proprio_dropout(proprio_cond)
+            if self.proprio_scale != 1.0:
+                proprio_cond = proprio_cond * self.proprio_scale
             if self.proprio_mode == "add":
                 global_cond = global_cond + proprio_cond
             else:
@@ -431,6 +447,9 @@ def main():
     proprio_dim = int(config.get('policy', {}).get('proprio_dim', 14))
     proprio_mode = str(config.get('policy', {}).get('proprio_mode', 'concat'))
     proprio_hidden = int(config.get('policy', {}).get('proprio_hidden', 256))
+    proprio_dropout = float(config.get('policy', {}).get('proprio_dropout', 0.0))
+    proprio_scale = float(config.get('policy', {}).get('proprio_scale', 1.0))
+    action_offset = int(config.get('data', {}).get('action_offset', 0))
     
     # 1. Dataset
     print("Creating Datasets...")
@@ -440,7 +459,7 @@ def main():
         horizon=config['data']['horizon'],
         n_obs_steps=config['data']['n_obs_steps'],
         use_proprio=use_proprio,
-        action_offset=int(config.get('data', {}).get('action_offset', 0)),
+        action_offset=action_offset,
     )
     
     dataloader = DataLoader(
@@ -487,6 +506,8 @@ def main():
             proprio_dim=proprio_dim,
             proprio_mode=proprio_mode,
             proprio_hidden=proprio_hidden,
+            proprio_dropout=proprio_dropout,
+            proprio_scale=proprio_scale,
         ).to(device)
     else:
         policy = DPRGBPolicy(
@@ -500,6 +521,8 @@ def main():
             proprio_dim=proprio_dim,
             proprio_mode=proprio_mode,
             proprio_hidden=proprio_hidden,
+            proprio_dropout=proprio_dropout,
+            proprio_scale=proprio_scale,
         ).to(device)
     
     # ✅ 新增: Fit normalizer (模仿RoboTwin原版DP)
@@ -529,6 +552,16 @@ def main():
         ap_stats = policy.normalizer['agent_pos'].params_dict['input_stats']
         print(f"  Agent_pos stats: min={ap_stats.min[:3]}...")
         print(f"  Agent_pos stats: max={ap_stats.max[:3]}...")
+        # 诊断：检查 agent_pos 与 action 的同步程度（泄漏风险）
+        try:
+            ap_last = all_agent_pos[:, -1, :]
+            act_first = all_actions[:, 0, :]
+            mse_same = torch.mean((ap_last - act_first) ** 2).item()
+            print(f"  Agent_pos vs Action (same step) MSE: {mse_same:.6f}")
+            if action_offset == 0 and mse_same < 1e-6:
+                print("  [Warning] action_offset=0 且 agent_pos==action，存在“抄答案”风险。建议 action_offset=1。")
+        except Exception:
+            pass
     
     # 3. Optimizer
     lr_value = float(config['train']['lr'])

@@ -1,22 +1,24 @@
-# 离线训练配置 - ws1 + pool + 本体感知
+# DP-Aligned Proprio 训练配置 - pool + proprio
+#
+# 关键区别（vs train_offline_pool_ws1_proprio.yaml）:
+# - 使用 train_offline_head_dp_aligned.py（agent_pos 直接 concat，不通过 MLP）
+# - 去掉 proprio_dropout / proprio_scale（原版 DP 没有这些）
+# - 去掉 proprio_mode / proprio_hidden（不再需要独立编码器）
 
 data:
-  features_dataset_dir: /home/gl/RoboTwin/policy/DP2DP3/features_model/data/offline_features_pool_ws1_proprio
+  features_dataset_dir: /home/gl/RoboTwin/policy/DP2DP3/features_model/data/offline_features_pool_ws1_proprio_fixed
 
   # 数据提取已做时间偏移（agent_pos=vector[t], action=vector[t+1]）
-  # 所以这里 action_offset 设为 0，避免双重偏移
   action_offset: 0
 
   horizon: 8
-  n_obs_steps: 2
-
+  n_obs_steps: 3
   camera_name: head_camera
 
   tasks:
     - lift_pot
 
   task_config: demo_clean
-
   use_left_arm: true
   use_right_arm: true
   include_gripper: true
@@ -31,20 +33,16 @@ train:
   num_workers: 4
   optimizer: adamw
   weight_decay: 1e-6
+  resume_ckpt: null
 
 policy:
   type: OfficialDP
   use_official_dp: true
   num_inference_steps: 100
-  hidden_dim: 512
-  # 本体感知（可开关）
+  # DP-Aligned proprio: 直接 concat，无需 MLP 参数
   use_proprio: true
   proprio_dim: 14
-  proprio_mode: concat
-  proprio_hidden: 256
-  # 抑制 proprio 过强带来的“抄答案/忽视视觉”
-  proprio_dropout: 0.2
-  proprio_scale: 0.5
+  # 注意：不需要 proprio_mode / proprio_hidden / proprio_dropout / proprio_scale
 
 device:
   gpu_ids: [0, 1]
@@ -55,8 +53,5 @@ output:
 
 checkpoint:
   expert_data_num: 50
-  ckpt_setting: demo_clean_pool_ws1_proprio
+  ckpt_setting: demo_clean_pool_ws1_dp_aligned_proprio
   seed: 0
-
-debug:
-  fast_dev_run: false
