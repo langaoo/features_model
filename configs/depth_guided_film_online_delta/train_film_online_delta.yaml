@@ -1,0 +1,57 @@
+# FiLM 时序差分训练配置 (DINOv3 + DA3 delta geo_vec)
+# ====================================================
+# 实验意图:
+#   geo_vec 改为时序差分: delta[t] = DA3_proj[t] - DA3_proj[t-1]
+#   静止前景 (锤子) 差分 ≈ 0, 只有运动目标保留非零信号
+#   对比 FiLM v1 (32%) 验证差分是否改善 beat_block_hammer
+#
+# 用法:
+#   cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+#   python tools/depth_guided_film_online_delta/train_film_online_delta.py \
+#     --config configs/depth_guided_film_online_delta/train_film_online_delta.yaml
+
+data:
+  zarr_base: /home/gl/RoboTwin/policy/DP2DP3/data
+  task_config: demo_clean
+  camera_name: head_camera
+  tasks:
+    - beat_block_hammer
+  horizon: 8
+  n_obs_steps: 3
+  n_action_steps: 6
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: true
+
+encoder:
+  # 2 模型: DINOv3(语义) + DA3(时序差分几何调制)
+  semantic_in_dim: 768
+  geometric_in_dim: 2048
+  proj_dim: 256
+  film_hidden: 256
+  out_dim: 1280
+  with_pos_enc: true
+  dropout: 0.1
+  max_tokens: 196
+
+policy:
+  num_inference_steps: 100
+
+train:
+  epochs: 600
+  batch_size: 128
+  lr: 0.0001
+  weight_decay: 0.000001
+  num_workers: 4
+
+precompute_batch_size: 32
+offload_backbone_after_precompute: true
+
+device:
+  gpu_ids: [0]
+
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_film_online_delta/beat_block_hammer-demo_clean-50-0
+  save_every: 100
+  expert_data_num: 50

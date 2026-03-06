@@ -1,0 +1,60 @@
+# ===========================
+# 通用 N 模型直接融合 + proprio 训练配置 (离线版)
+# ===========================
+# 使用 train_direct_fusion_offline_generic_proprio.py
+#
+# 核心: 通过 model_names 指定任意模型子集
+# 支持: [croco, vggt, dinov3, da3] 的任意组合
+#
+# 本文件: 2模型直融 (CroCo + DINOv3)
+# 要换模型? 只需修改 model_names 和 vis_zarr_roots
+
+data:
+  robotwin_data_root: /home/gl/RoboTwin/data
+  task_config: demo_clean
+  camera_name: head_camera
+
+  tasks:
+    - lift_pot
+
+  horizon: 8
+  n_obs_steps: 3
+
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: true
+
+  # ★ 核心配置: 选择哪些模型 ★
+  # 可选: croco(1024d), vggt(2048d), dinov3(768d), da3(2048d)
+  # 顺序无所谓，脚本内部会按全局 index 排序
+  model_names:
+    - croco
+    - dinov3
+
+  # zarr 路径必须和 model_names 一一对应（同顺序）
+  vis_zarr_roots:
+    - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_croco_encoder_dict_unified_zarr
+    - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_dinov3_encoder_dict_unified_zarr
+
+fusion:
+  type: weighted
+  out_dim: 1280
+
+policy:
+  num_inference_steps: 100
+
+train:
+  epochs: 600
+  batch_size: 32
+  lr: 0.0001
+  weight_decay: 0.000001
+  num_workers: 4
+
+device:
+  gpu_ids: [0]
+
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_direct_fusion_ws1/lift_pot-demo_clean-50-0-croco_dinov3-proprio
+  save_every: 100
+  expert_data_num: 50

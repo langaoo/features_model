@@ -1,0 +1,61 @@
+# DA3-FiLM + Drifting Head 训练配置
+# =====================================
+# Innovation 2: 替换 DDPM head 为 Drifting Model (arXiv:2602.04770)
+#   - 推理时 1-step inference (1 NFE) 而非 DDPM 的 100 步迭代
+#   - 训练目标: drifting loss（均值漂移 MSE）
+#
+# 用法:
+#   cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+#   python tools/depth_guided_film_drifting/train_film_drifting.py \
+#     --config configs/depth_guided_film_drifting/train_film_drifting.yaml
+
+data:
+  zarr_base: /home/gl/RoboTwin/policy/DP2DP3/data
+  task_config: demo_clean
+  camera_name: head_camera
+  tasks:
+    - beat_block_hammer
+  horizon: 8
+  n_obs_steps: 3
+  n_action_steps: 6
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: true
+
+encoder:
+  semantic_in_dim: 768
+  geometric_in_dim: 2048
+  proj_dim: 256
+  film_hidden: 256
+  out_dim: 1280
+  with_pos_enc: true
+  dropout: 0.1
+  max_tokens: 196
+
+# ★ Drifting head 超参数（新增，DDPM 版无此字段）
+drifting:
+  # temp 需根据动作空间维度 D 调整：
+  #   - 2D toy (Colab 示例):  temp=0.05  (pairwise dist ≈ 0.5)
+  #   - 112D 动作空间 (8×14): temp≈3.0   (pairwise dist ≈ √112 ≈ 7.5)
+  # 规则: temp ≈ 0.05 × √(D / 2) ≈ 0.05 × 7.5 ≈ 0.37, 实用值取 3.0
+  temp: 3.0           # 适配 112D 动作空间, 0.05 在高维会退化为均匀 kernel
+  hidden_dim: 1024    # DriftingActionGenerator 隐层宽度
+
+train:
+  epochs: 600
+  batch_size: 128
+  lr: 0.0001
+  weight_decay: 0.000001
+  num_workers: 4
+
+precompute_batch_size: 32
+offload_backbone_after_precompute: true
+
+device:
+  gpu_ids: [0]
+
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_film_drifting/beat_block_hammer-demo_clean-50-0
+  save_every: 100
+  expert_data_num: 50

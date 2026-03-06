@@ -22,7 +22,6 @@ class SingleModelFeatureExtractor:
         self.model_name = model_name.lower()
         self.gpu_id = gpu_id
         self.device = torch.device(f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu')
-        
         # 输出维度
         self.output_dims = {
             'croco': 1024,
@@ -400,13 +399,18 @@ class SingleModelFeatureExtractor:
         return feats.cpu().float().numpy()
     
     def _extract_da3(self, images):
-        """Depth-Anything-3特征提取（与离线脚本一致）"""
+        """Depth-Anything-3特征提取（与离线脚本一致）。
+
+        DA3 将多帧输入视为序列并聚合，因此必须**逐帧**调用，
+        最终将 To 帧结果 stack 成 [To, 2048]。
+        """
         import tempfile
         import os as _os
 
-        def _da3_forward_from_paths(paths: list[str]) -> np.ndarray:
+        def _da3_forward_single(path: str) -> np.ndarray:
+            """对单张图像提取 DA3 特征，返回 [2048] 向量。"""
             imgs_cpu, _, _ = self.model._preprocess_inputs(
-                paths,
+                [path],
                 extrinsics=None,
                 intrinsics=None,
                 process_res=self.da3_process_res,
@@ -432,20 +436,22 @@ class SingleModelFeatureExtractor:
             if not feats:
                 raise RuntimeError("backbone返回空特征")
             tokens, _ = feats[0]
-            return tokens.mean(dim=[1, 2]).detach().cpu().numpy()
+            # tokens: [1, Hf, Wf, C] 或 [1, K, C] → mean pool → [C]
+            feat_vec = tokens.mean(dim=list(range(1, tokens.ndim - 1))).squeeze(0)  # [C]
+            return feat_vec.detach().cpu().float().numpy()
 
-        temp_paths = []
-        try:
-            for img in images:
+        # 逐帧提取，保证返回 [To, 2048]
+        all_feats = []
+        for img in images:
+            tmp_path = None
+            try:
                 with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-                    temp_paths.append(f.name)
+                    tmp_path = f.name
                     img.save(f.name)
+                feat = _da3_forward_single(tmp_path)
+                all_feats.append(feat)
+            finally:
+                if tmp_path and _os.path.exists(tmp_path):
+                    _os.unlink(tmp_path)
 
-            feat = _da3_forward_from_paths(temp_paths)
-            if feat.ndim == 1:
-                feat = feat[None, :]
-            return feat
-        finally:
-            for p in temp_paths:
-                if _os.path.exists(p):
-                    _os.unlink(p)
+        return np.stack(all_feats, axis=0)  # [To, 2048]

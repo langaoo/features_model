@@ -71,6 +71,8 @@ class DPAlignedPolicy(nn.Module):
         num_inference_steps: int = 100,
         use_proprio: bool = False,
         proprio_dim: int = 14,
+        vis_projector_type: str = "none",  # "none", "linear", "mlp"
+        vis_projector_dim: int = 1280,     # projector 输出维度
     ):
         super().__init__()
         if not HAS_OFFICIAL_DP:
@@ -85,12 +87,35 @@ class DPAlignedPolicy(nn.Module):
         self.use_proprio = bool(use_proprio)
         self.proprio_dim = int(proprio_dim) if use_proprio else 0
 
+        # 可选的可学习 vis_projector（方案A：对齐特征后加可学习投影层）
+        self.vis_projector_type = vis_projector_type
+        if vis_projector_type == "linear":
+            self.vis_projector = nn.Sequential(
+                nn.Linear(vis_dim, vis_projector_dim),
+                nn.LayerNorm(vis_projector_dim),
+            )
+            effective_vis_dim = vis_projector_dim
+            print(f"[DPAlignedPolicy] vis_projector=linear: {vis_dim} -> {vis_projector_dim}")
+        elif vis_projector_type == "mlp":
+            self.vis_projector = nn.Sequential(
+                nn.Linear(vis_dim, vis_dim * 2),
+                nn.GELU(),
+                nn.Linear(vis_dim * 2, vis_projector_dim),
+                nn.LayerNorm(vis_projector_dim),
+            )
+            effective_vis_dim = vis_projector_dim
+            print(f"[DPAlignedPolicy] vis_projector=mlp: {vis_dim} -> {vis_dim*2} -> {vis_projector_dim}")
+        else:
+            self.vis_projector = None
+            effective_vis_dim = vis_dim
+            print(f"[DPAlignedPolicy] vis_projector=none (pass-through)")
+
         # LinearNormalizer: fit on {"action": ..., "agent_pos": ...}
         self.normalizer = LinearNormalizer()
 
-        # obs_encoder 输入维度：n_obs_steps * (vis_dim + proprio_dim)
+        # obs_encoder 输入维度：n_obs_steps * (effective_vis_dim + proprio_dim)
         # 这与原版 DP 的 global_cond_dim = obs_feature_dim * n_obs_steps 一致
-        per_step_dim = vis_dim + (self.proprio_dim if use_proprio else 0)
+        per_step_dim = effective_vis_dim + (self.proprio_dim if use_proprio else 0)
         obs_input_dim = n_obs_steps * per_step_dim
 
         self.obs_encoder = nn.Sequential(
@@ -125,13 +150,17 @@ class DPAlignedPolicy(nn.Module):
             agent_pos: [B, To, proprio_dim] 本体感知（可选）
 
         Returns:
-            obs_flat: [B, To * (vis_dim + proprio_dim)]
+            obs_flat: [B, To * (effective_vis_dim + proprio_dim)]
         """
         B = obs.shape[0]
+        # 如果有可学习的 vis_projector，先对视觉特征做投影
+        if self.vis_projector is not None:
+            B, To, D = obs.shape
+            obs = self.vis_projector(obs.reshape(B * To, D)).reshape(B, To, -1)
         if self.use_proprio and agent_pos is not None:
             # 归一化 agent_pos（模仿 DP 的 self.normalizer.normalize(obs_dict)）
             npos = self.normalizer["agent_pos"].normalize(agent_pos).to(obs.device)
-            # 直接拼接：[B, To, vis_dim] || [B, To, proprio_dim] → [B, To, vis_dim+proprio_dim]
+            # 直接拼接：[B, To, effective_vis_dim] || [B, To, proprio_dim] → [B, To, effective_vis_dim+proprio_dim]
             obs_combined = torch.cat([obs, npos], dim=-1)
         else:
             obs_combined = obs
@@ -497,6 +526,8 @@ def main():
             proprio_dim=proprio_dim,
         ).to(device)
     else:
+        vis_projector_type = str(config.get('policy', {}).get('vis_projector_type', 'none'))
+        vis_projector_dim = int(config.get('policy', {}).get('vis_projector_dim', vis_dim))
         policy = DPAlignedPolicy(
             vis_dim=vis_dim,
             action_dim=action_dim,
@@ -506,6 +537,8 @@ def main():
             num_inference_steps=config['policy']['num_inference_steps'],
             use_proprio=use_proprio,
             proprio_dim=proprio_dim,
+            vis_projector_type=vis_projector_type,
+            vis_projector_dim=vis_projector_dim,
         ).to(device)
 
     # 3. Fit normalizer
@@ -636,6 +669,8 @@ def main():
                 'policy_type': 'dp_aligned_dual_stream' if use_tokens else 'dp_aligned',
                 'policy_class': 'DPAlignedDualStreamPolicy' if use_tokens else 'DPAlignedPolicy',
                 'token_dim': int(token_dim) if use_tokens else None,
+                'vis_projector_type': getattr(policy, 'vis_projector_type', 'none'),
+                'vis_projector_dim': int(config.get('policy', {}).get('vis_projector_dim', vis_dim)) if not use_tokens else None,
                 'optimizer': optimizer.state_dict(),
                 'epoch': epoch + 1,
                 'config': config,

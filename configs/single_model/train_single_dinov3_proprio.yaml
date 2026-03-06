@@ -10,14 +10,14 @@ data:
   expert_data_num: 50
   
   # DINOv3 离线特征路径
-  vis_zarr_root: /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_dinov3_encoder_dict_unified_zarr
+  vis_zarr_root: /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_vggt_encoder_dict_unified_zarr
   
   # 数据采样（与DP原版 robot_dp_14.yaml 对齐）
   horizon: 8
   n_obs_steps: 3
 
 model:
-  name: dinov3
+  name: vggt
 
 policy:
   num_inference_steps: 100
@@ -33,5 +33,5 @@ device:
   gpu_id: 0
 
 checkpoint:
-  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_single_model_ws1/lift_pot-demo_clean-50-dinov3-proprio
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_single_model_ws1/lift_pot-demo_clean-50-vggt-proprio
   save_every: 100

@@ -1,0 +1,87 @@
+# ===========================
+# Depth-Guided Cross-Attention Fusion + proprio 训练配置 (离线版)
+# ===========================
+# 方案: 语义组 (CroCo + VGGT + DINOv3) 作 Query
+#       几何组 (DA3) 作 Key/Value
+#       Cross-Attention 让语义 token 按深度感知空间聚合
+#       纯 Action Loss，不需要点云 teacher，不需要对齐模块
+# 对标: Direct Fusion 78% (K 实验 86%, Direct Fusion 78%)
+
+data:
+  robotwin_data_root: /home/gl/RoboTwin/data
+  task_config: demo_clean
+  camera_name: head_camera
+
+  tasks:
+    - lift_pot
+
+  # 与其他实验对齐
+  horizon: 8
+  n_obs_steps: 3
+
+  # 双臂配置（兼容字段）
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: true
+
+  # 4 模型离线 zarr 特征路径（顺序严格: croco → vggt → dinov3 → da3）
+  # ws1: shape = [T, 1, Hf, Wf, C]（窗口长度=1，T 即帧数）
+  vis_zarr_roots:
+    - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_croco_encoder_dict_unified_zarr
+    - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_vggt_encoder_dict_unified_zarr
+    - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_dinov3_encoder_dict_unified_zarr
+    - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_da3_encoder_dict_unified_zarr
+
+# ─── Depth-Guided Encoder 配置 ───────────────────────────────
+encoder:
+  # 各模型输入通道（顺序：CroCo=1024, VGGT=2048, DINOv3=768）
+  semantic_in_dims: [1024, 2048, 768]
+  # DA3 输入通道
+  geometric_in_dim: 2048
+
+  # 共享投影维度（所有模型先映射到这里）
+  proj_dim: 512
+
+  # Cross-Attention 配置
+  n_heads: 8      # 注意力头数（proj_dim=512 可被整除）
+  n_layers: 2     # Cross-Attention 层数（语义→几何反复迭代 n_layers 次）
+
+  # 语义 token 融合策略: concat_proj（推荐）/ mean / weighted
+  semantic_fusion: concat_proj
+
+  # Readout 方式: mean（推荐，快）/ attn（可学习，慢）
+  pool: mean
+
+  # 最终输出维度（与 Direct Fusion 对齐）
+  out_dim: 1280
+
+  # Dropout
+  dropout: 0.1
+
+  # 每模型最多保留 token 数（None=全部）
+  # 注：CroCo/DINOv3=196, VGGT=1036, DA3=972
+  # 限制到 196 节省显存（几何信息主要在低频，196 个等间隔采样已足够）
+  max_tokens: 196
+
+# ─── 策略网络 ─────────────────────────────────────────────────
+policy:
+  num_inference_steps: 100
+
+# ─── 训练配置 ─────────────────────────────────────────────────
+train:
+  epochs: 600
+  batch_size: 32
+  lr: 0.0001
+  weight_decay: 0.000001
+  num_workers: 4
+
+# ─── 设备配置 ─────────────────────────────────────────────────
+device:
+  gpu_ids: [0]
+
+# ─── Checkpoint 配置 ──────────────────────────────────────────
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_depth_guided/lift_pot-demo_clean-50-0
+  save_every: 100
+  expert_data_num: 50

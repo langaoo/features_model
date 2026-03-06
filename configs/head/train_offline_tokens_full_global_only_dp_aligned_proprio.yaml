@@ -1,0 +1,65 @@
+# 关键消融实验: tokens_full alignment encoder 的 obs_aligned + 纯 DPAlignedPolicy（无 DualStream）
+#
+# 目的: 验证 tokens_full 的全局向量（attention-pooled）的真实质量
+#   - 数据来源: tokens_full offline features（包含 obs_aligned + obs_tokens）
+#   - 只使用 obs_aligned[T,1280]，忽略 obs_tokens
+#   - 不使用 DualStream / cross-attention / gate
+#   - 纯 DPAlignedPolicy: obs_aligned + proprio → concat → obs_encoder → UNet
+#
+# 与 force_gate=0 推理的区别:
+#   - force_gate=0 的模型在训练时仍然有 DualStream 结构（obs_encoder/proprio_encoder 分离）
+#   - 本实验训练时就没有 DualStream，obs_encoder 的输入是 [obs_aligned; agent_pos]
+#   - 这是一个干净的消融：测试 tokens_full 全局向量 + 简单 policy head 的极限
+
+data:
+  features_dataset_dir: /home/gl/RoboTwin/policy/DP2DP3/features_model/data/offline_features_dual_stream_tokens_full_proprio
+
+  action_offset: 0
+
+  horizon: 8
+  n_obs_steps: 3
+  camera_name: head_camera
+
+  tasks:
+    - lift_pot
+
+  task_config: demo_clean
+  use_left_arm: true
+  use_right_arm: true
+  include_gripper: true
+
+encoder:
+  checkpoint: /home/gl/RoboTwin/policy/DP2DP3/features_model/outputs/train_rgb2pc_runs/run_ws1_tokens_full/ckpt_final.pt
+
+train:
+  epochs: 600
+  batch_size: 32
+  lr: 1e-4
+  num_workers: 4
+  optimizer: adamw
+  weight_decay: 1e-6
+  resume_ckpt: null
+
+policy:
+  type: OfficialDP
+  use_official_dp: true
+  num_inference_steps: 100
+  # 关键: 不使用 tokens → 走 DPAlignedPolicy 路径
+  use_tokens: false
+  # DP-Aligned proprio
+  use_proprio: true
+  proprio_dim: 14
+  # 无 vis_projector（直接用 obs_aligned）
+  vis_projector_type: none
+
+device:
+  gpu_ids: [0, 1]
+
+output:
+  dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints
+  save_every_n_epochs: 100
+
+checkpoint:
+  expert_data_num: 50
+  ckpt_setting: demo_clean_tokens_full_global_only_dp_aligned_proprio
+  seed: 0

@@ -1,0 +1,64 @@
+# 在线 2 模型 DA3-FiLM v2 训练配置 (AttentionPooling 替代 mean_pool)
+# ============================================================
+# 与 v1 (train_film_online.yaml) 的关键区别:
+#   - encoder.max_sem_tokens: DINOv3 token 数 (同 v1 的 max_tokens=196)
+#   - encoder.max_geo_tokens: DA3 token 数 (v2 保留更多: 256, 比 v1 的 196 多)
+#   - AttentionPooling 零初始化 → 训练初期行为等价于 mean_pool → 训练稳定
+#
+# 用法:
+#   cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+#   python tools/depth_guided_film_online_v2/train_film_online_v2.py \
+#     --config configs/depth_guided_film_online_v2/train_film_online_v2.yaml
+
+data:
+  zarr_base: /home/gl/RoboTwin/policy/DP2DP3/data   # zarr 文件所在目录 (由 DP2DP3/process_data.py 生成)
+  # zarr_base: /home/gl/RoboTwin/policy/DP/data  # 旧路径 (DP 目录, 已弃用)
+  task_config: demo_clean
+  camera_name: head_camera
+  tasks:
+    - beat_block_hammer
+  horizon: 8
+  n_obs_steps: 3
+  n_action_steps: 6
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: true
+
+encoder:
+  # 2 模型: DINOv3(语义) + DA3(几何调制 FiLM)
+  semantic_in_dim: 768       # DINOv3 输出维度
+  geometric_in_dim: 2048     # DA3 输出维度
+  proj_dim: 256
+  film_hidden: 256
+  out_dim: 1280
+  with_pos_enc: true
+  dropout: 0.1
+  # v2: 分别设置 sem/geo token 数
+  max_sem_tokens: 196        # DINOv3: 14×14 全部 token
+  max_geo_tokens: 256        # DA3: 保留 256 个 token (空间覆盖比 v1 的 196 更全)
+  # 内存参考 (float16, beat_block_hammer 5705帧):
+  #   DINOv3 cache: 5705×196×768×2 ≈ 1.7 GB
+  #   DA3    cache: 5705×256×2048×2 ≈ 5.9 GB  (比 v1 的 3.8GB 多 ~2GB, 仍可接受)
+
+policy:
+  num_inference_steps: 100
+
+train:
+  epochs: 600
+  batch_size: 128
+  lr: 0.0001
+  weight_decay: 0.000001
+  num_workers: 4
+
+# 预提取 batch size (仅启动时用一次)
+precompute_batch_size: 32
+offload_backbone_after_precompute: true
+
+device:
+  gpu_ids: [0]
+
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_film_online_v2/beat_block_hammer-demo_clean-50-0
+  save_every: 100
+  expert_data_num: 50

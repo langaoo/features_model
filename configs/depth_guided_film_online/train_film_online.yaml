@@ -1,0 +1,59 @@
+# 在线 2 模型 DA3-FiLM 训练配置 (DINOv3 + DA3)
+# ============================================
+# 与离线 4 模型版 train_depth_guided_film_proprio.yaml 的区别:
+#   - 去掉 vis_zarr_roots (在线提取, 不读 zarr)
+#   - 去掉 CroCo / VGGT, 只用 DINOv3(768) + DA3(2048)
+#   - batch_size 减小 (在线提取占显存)
+#
+# 用法:
+#   cd /home/gl/RoboTwin/policy/DP2DP3/features_model
+#   python tools/depth_guided_film_online/train_film_online.py \
+#     --config configs/depth_guided_film_online/train_film_online.yaml
+
+data:
+  zarr_base: /home/gl/RoboTwin/policy/DP2DP3/data   # zarr 文件所在目录 (由 DP2DP3/process_data.py 生成)
+  # zarr_base: /home/gl/RoboTwin/policy/DP/data  # 旧路径 (DP 目录, 已弃用)
+  task_config: demo_clean
+  camera_name: head_camera
+  tasks:
+    - place_a2b_left
+  horizon: 8
+  n_obs_steps: 3
+  n_action_steps: 6              # ★ 对齐 robot_dp_14.yaml
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: true
+
+encoder:
+  # 2 模型: DINOv3(语义) + DA3(几何调制)
+  semantic_in_dim: 768     # DINOv3 输出维度
+  geometric_in_dim: 2048   # DA3 输出维度
+  proj_dim: 256
+  film_hidden: 256
+  out_dim: 1280
+  with_pos_enc: true
+  dropout: 0.1
+  max_tokens: 196
+
+policy:
+  num_inference_steps: 100
+
+train:
+  epochs: 600
+  batch_size: 128             # zarr 缓存后无 backbone 开销, 可开大 batch
+  lr: 0.0001
+  weight_decay: 0.000001
+  num_workers: 4              # 纯 Tensor 数据集, 多 worker 没问题
+
+# 预提取 batch size (仅启动时用一次)
+precompute_batch_size: 32
+offload_backbone_after_precompute: true   # 提取完后把 backbone 移到 CPU 释放显存
+
+device:
+  gpu_ids: [0]
+
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_film_online/place_a2b_left-demo_clean-50-0
+  save_every: 100
+  expert_data_num: 50

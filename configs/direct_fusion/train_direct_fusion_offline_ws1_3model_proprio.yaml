@@ -1,0 +1,52 @@
+# ===========================
+# 3模型直接融合 + proprio 训练配置 (离线版)
+# ===========================
+# 目的: 与 depth_guided (3RGB + DA3深度) 做对比，验证仅3个RGB模型直融的性能基线
+# 与 train_direct_fusion_offline_ws1_proprio.yaml 的区别: 去掉 DA3，只保留 croco/vggt/dinov3
+# 3模型 in_dims: (1024, 2048, 768)
+
+data:
+  robotwin_data_root: /home/gl/RoboTwin/data
+  task_config: demo_clean
+  camera_name: head_camera
+  
+  tasks: 
+    - lift_pot
+  
+  # 与DP原版 robot_dp_14.yaml 对齐
+  horizon: 8
+  n_obs_steps: 3
+  
+  # 双臂配置（兼容字段，实际由 vector 决定）
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: true
+  
+  # 3模型离线zarr特征路径 (顺序: croco → vggt → dinov3，去掉 DA3)
+  vis_zarr_roots:
+    - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_croco_encoder_dict_unified_zarr
+    - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_vggt_encoder_dict_unified_zarr
+    - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_dinov3_encoder_dict_unified_zarr
+
+fusion:
+  type: weighted
+  out_dim: 1280
+
+policy:
+  num_inference_steps: 100
+
+train:
+  epochs: 600
+  batch_size: 32
+  lr: 0.0001
+  weight_decay: 0.000001
+  num_workers: 4
+
+device:
+  gpu_ids: [0]
+
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_direct_fusion_ws1/lift_pot-demo_clean-50-0-3model-proprio
+  save_every: 100
+  expert_data_num: 50

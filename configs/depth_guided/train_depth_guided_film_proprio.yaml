@@ -1,0 +1,50 @@
+# DA3-FiLM Depth-Guided Fusion + proprio 训练配置
+# 参数量: ~1.5M (vs CrossAttn ~14M), 50 条 demo 不过拟合
+# 对比: depth_guided CrossAttn 71% / 直融 4模型 78%
+
+data:
+  robotwin_data_root: /home/gl/RoboTwin/data
+  task_config: demo_clean
+  camera_name: head_camera
+  tasks:
+    - lift_pot
+  horizon: 8
+  n_obs_steps: 3
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: true
+  vis_zarr_roots:
+    - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_croco_encoder_dict_unified_zarr
+    - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_vggt_encoder_dict_unified_zarr
+    - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_dinov3_encoder_dict_unified_zarr
+    - /home/gl/RoboTwin/policy/DP2DP3/features_model/rgb_dataset_ws1/features_da3_encoder_dict_unified_zarr
+
+encoder:
+  semantic_in_dims: [1024, 2048, 768]
+  geometric_in_dim: 2048
+  proj_dim: 256
+  film_hidden: 256
+  semantic_fusion: concat_proj
+  with_pos_enc: true
+  out_dim: 1280
+  dropout: 0.1
+  max_tokens: 196
+
+policy:
+  num_inference_steps: 100
+
+train:
+  epochs: 600
+  batch_size: 32
+  lr: 0.0001
+  weight_decay: 0.000001
+  num_workers: 4
+
+device:
+  gpu_ids: [0]
+
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_depth_guided_film/lift_pot-demo_clean-50-0
+  save_every: 100
+  expert_data_num: 50
