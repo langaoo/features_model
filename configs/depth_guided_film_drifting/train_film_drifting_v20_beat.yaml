@@ -1,0 +1,57 @@
+# DA3-FiLM + Drifting Head V20 — beat_block_hammer
+# K=32 + V×K补偿 (代码内置) + drift_scale=1.0
+# =============================================================
+# 核心改动 (对比 V18/V19):
+#   1. drift_scale: 1.0 (V×K补偿已内置于compute_local_drift, 无需人为放大)
+#   2. K: 32 (平衡漂移估计精度与训练速度)
+#   3. batch_size: 32, 单GPU即可容纳
+#   4. epochs: 600, save_every: 100 (评测100/300/600三个checkpoint)
+#   5. 对比V18: V18用drift_scale=50但无V×K补偿; V20用drift_scale=1.0+V×K补偿
+#   6. 对比V19: V19用K=4096+sub_K=512太慢; V20回到K=32实用路线
+
+data:
+  zarr_base: /home/gl/RoboTwin/policy/DP2DP3/data
+  task_config: demo_clean
+  camera_name: head_camera
+  tasks:
+    - beat_block_hammer
+  horizon: 8
+  n_obs_steps: 3
+  n_action_steps: 6
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: true
+
+encoder:
+  semantic_in_dim: 768
+  geometric_in_dim: 2048
+  proj_dim: 256
+  film_hidden: 256
+  out_dim: 1280
+  with_pos_enc: true
+  dropout: 0.1
+  max_tokens: 196
+
+drifting:
+  temp_scale: 1.0
+  K: 32
+  drift_scale: 1.0
+
+train:
+  epochs: 600
+  batch_size: 32
+  lr: 0.0003
+  weight_decay: 0.000001
+  num_workers: 4
+
+precompute_batch_size: 32
+offload_backbone_after_precompute: true
+
+device:
+  gpu_ids: [0]
+
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_film_drifting/beat_block_hammer-demo_clean-50-0-v20
+  save_every: 100
+  expert_data_num: 50

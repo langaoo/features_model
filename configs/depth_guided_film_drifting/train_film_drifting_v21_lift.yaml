@@ -1,0 +1,60 @@
+# DA3-FiLM + Drifting Head V21 — lift_pot
+# =============================================================
+# 基于 V18，专项修复"零漂移振荡"与 batch 不对齐问题
+#
+# 核心改动 (对比 V18):
+#   1. ema_decay: 0.9999 — 强 EMA 模型权重，平滑 late-epoch 振荡
+#      lift_pot@100ep=68% 但 @300ep 降至 51%；EMA 预期把 600ep 维持在 65%+
+#   2. grad_accum_steps: 4 — effective batch = 32 * 4 = 128，对齐 DP baseline
+#   3. drift_scale: 50.0 constant — K*alpha 理论支撑
+# =============================================================
+
+data:
+  zarr_base: /home/gl/RoboTwin/policy/DP2DP3/data
+  task_config: demo_clean
+  camera_name: head_camera
+  tasks:
+    - lift_pot
+  horizon: 8
+  n_obs_steps: 3
+  n_action_steps: 6
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: true
+
+encoder:
+  semantic_in_dim: 768
+  geometric_in_dim: 2048
+  proj_dim: 256
+  film_hidden: 256
+  out_dim: 1280
+  with_pos_enc: true
+  dropout: 0.1
+  max_tokens: 196
+
+drifting:
+  temp_scale: 1.0
+  K: 32
+  drift_scale: 50.0
+  drift_scale_schedule: "constant"
+
+train:
+  epochs: 600
+  batch_size: 32
+  grad_accum_steps: 1            # effective batch = 128，对齐 DP
+  lr: 0.0003
+  weight_decay: 0.000001
+  num_workers: 4
+  ema_decay: 0.9999              # 强 EMA
+
+precompute_batch_size: 32
+offload_backbone_after_precompute: true
+
+device:
+  gpu_ids: [1]
+
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_film_drifting/lift_pot-demo_clean-v21-ema-50-0
+  save_every: 100
+  expert_data_num: 50

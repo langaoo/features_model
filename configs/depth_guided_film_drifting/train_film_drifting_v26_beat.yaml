@@ -1,0 +1,79 @@
+# DA3-FiLM + Drifting Head V26 — beat_block_hammer
+# =============================================================
+# V26 设计目标: drift_scale=K=32 (effective step=1.0, 无 overshoot)
+#
+# 核心改动:
+#   drift_scale = 32 (was 50 in V18/V23)
+#   effective step = drift_scale / K = 32/32 = 1.0
+#
+# 理论依据:
+#   - 论文的固定点迭代是 f ← f + V (步长隐含=1)
+#   - V18/V23 用 scale=50, effective step=50/32≈1.56 (overshoot)
+#   - overshoot 意味着 target 超过了 expert 位置
+#   - 在 50 demo 的低数据场景下, overshoot 放大了 V 的估计误差
+#   - scale=K=32 → target 精确落在 expert (当 V 估计完美时)
+#   - 代价: 前期收敛可能慢一些, 但 600 epoch 足够
+#
+# 其余参数与 V23 相同:
+#   - batch_size=128, lr=1e-4, ema=0.999 (对齐 DP)
+#   - K=32, temp=1.0, constant schedule
+# =============================================================
+
+data:
+  zarr_base: /home/gl/RoboTwin/policy/DP2DP3/data
+  task_config: demo_clean
+  camera_name: head_camera
+  tasks:
+    - beat_block_hammer
+  horizon: 8
+  n_obs_steps: 3
+  n_action_steps: 6
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: true
+
+encoder:
+  semantic_in_dim: 768
+  geometric_in_dim: 2048
+  proj_dim: 256
+  film_hidden: 256
+  out_dim: 1280
+  with_pos_enc: true
+  dropout: 0.1
+  max_tokens: 196
+
+drifting:
+  temp_scale: 1.0
+  K: 32
+  drift_scale: 32.0
+  drift_scale_schedule: "constant"
+
+train:
+  epochs: 600
+  batch_size: 128
+  grad_accum_steps: 1
+  lr: 0.0001
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  weight_decay: 0.000001
+  num_workers: 4
+  ema_decay: 0.999
+
+precompute_batch_size: 32
+offload_backbone_after_precompute: true
+
+device:
+  gpu_ids: [1]
+
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_film_drifting/beat_block_hammer-demo_clean-v26-scale32-50-0
+  save_every: 100
+  expert_data_num: 50
+
+wandb:
+  enable: true
+  project: geo_drift_policy
+  entity: ""
+  run_name: drifting_v26_beat_scale32
+  mode: offline

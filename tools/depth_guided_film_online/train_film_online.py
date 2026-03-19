@@ -59,6 +59,48 @@ from features_common.depth_guided_film_online.encoder_film_2model import DA3Film
 from features_common.depth_guided_film_online.extractors_2model import TwoModelExtractors
 
 
+def _init_wandb(config: dict, save_dir: Path | None = None):
+    wandb_cfg = config.get("wandb", {})
+    if not bool(wandb_cfg.get("enable", False)):
+        return None
+
+    try:
+        import wandb
+    except Exception as e:
+        print(f"[wandb] import 失败，自动禁用: {e}")
+        return None
+
+    task_name = config.get("data", {}).get("tasks", "unknown")
+    if isinstance(task_name, list):
+        task_name = task_name[0] if task_name else "unknown"
+    run_name = wandb_cfg.get("run_name", "")
+    if not run_name:
+        run_name = f"film_online_{task_name}"
+
+    init_kwargs = {
+        "project": wandb_cfg.get("project", "geo_drift_policy"),
+        "name": run_name,
+        "config": config,
+    }
+    if wandb_cfg.get("entity", ""):
+        init_kwargs["entity"] = wandb_cfg["entity"]
+    if wandb_cfg.get("mode", ""):
+        init_kwargs["mode"] = wandb_cfg["mode"]
+    if save_dir is not None:
+        init_kwargs["dir"] = str(save_dir)
+
+    try:
+        run = wandb.init(**init_kwargs)
+        print(
+            f"[wandb] 已启用: project={init_kwargs['project']} "
+            f"name={run_name} mode={init_kwargs.get('mode', 'online')}"
+        )
+        return run
+    except Exception as e:
+        print(f"[wandb] 初始化失败，自动禁用: {e}")
+        return None
+
+
 # ============================================================
 # Policy
 # ============================================================
@@ -428,6 +470,7 @@ def main():
     save_dir   = Path(config["checkpoint"]["save_dir"])
     save_every = int(config["checkpoint"].get("save_every", 100))
     save_dir.mkdir(parents=True, exist_ok=True)
+    wandb_run = _init_wandb(config, save_dir=save_dir)
     best_loss  = float("inf")
     avg_loss   = float("inf")
 
@@ -476,6 +519,16 @@ def main():
             f"Epoch {epoch+1:4d}/{total_epochs}:  "
             f"Loss={avg_loss:.6f}  LR={scheduler.get_last_lr()[0]:.2e}"
         )
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "epoch": epoch + 1,
+                    "train/loss": avg_loss,
+                    "train/lr": scheduler.get_last_lr()[0],
+                    "train/batch_size": int(train_cfg["batch_size"]),
+                },
+                step=epoch + 1,
+            )
 
         if (epoch + 1) % save_every == 0:
             ckpt = {
@@ -496,6 +549,8 @@ def main():
                 best_loss = avg_loss
                 torch.save(ckpt, save_dir / "best.ckpt")
                 print(f"  → New best!")
+                if wandb_run is not None:
+                    wandb_run.log({"best/loss": best_loss, "best/epoch": epoch + 1}, step=epoch + 1)
 
     final_ckpt = {
         "policy":       policy.state_dict(),
@@ -510,6 +565,8 @@ def main():
     torch.save(final_ckpt, save_dir / f"{total_epochs}.ckpt")
     print(f"\n最终 ckpt: {save_dir}/{total_epochs}.ckpt")
     print(f"训练完成! 最佳 Loss: {best_loss:.6f}")
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

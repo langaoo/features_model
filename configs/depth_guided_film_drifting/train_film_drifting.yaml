@@ -35,12 +35,14 @@ encoder:
 
 # ★ Drifting head 超参数（新增，DDPM 版无此字段）
 drifting:
-  # temp 需根据动作空间维度 D 调整：
-  #   - 2D toy (Colab 示例):  temp=0.05  (pairwise dist ≈ 0.5)
-  #   - 112D 动作空间 (8×14): temp≈3.0   (pairwise dist ≈ √112 ≈ 7.5)
-  # 规则: temp ≈ 0.05 × √(D / 2) ≈ 0.05 × 7.5 ≈ 0.37, 实用值取 3.0
-  temp: 3.0           # 适配 112D 动作空间, 0.05 在高维会退化为均匀 kernel
-  hidden_dim: 1024    # DriftingActionGenerator 隐层宽度
+  # 温度参数 (与官方 toy_mean_drift.py 一致)
+  temp_scale: 0.05
+  # Per-episode grouped batching (论文 Section 4:
+  #   "For each label, we perform Alg. 1 independently")
+  # 每个 batch 从 n_episodes_per_batch 个 episode 中采样
+  n_episodes_per_batch: 8
+  # 每个 episode 采 samples_per_episode 个样本
+  samples_per_episode: 16
 
 train:
   epochs: 600
@@ -57,5 +59,5 @@ device:
 
 checkpoint:
   save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_film_drifting/beat_block_hammer-demo_clean-50-0
-  save_every: 100
+  save_every: 50
   expert_data_num: 50

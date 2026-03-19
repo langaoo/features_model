@@ -1,0 +1,58 @@
+# DA3-FiLM + Drifting Head V18 — beat_block_hammer
+# K=32 大粒子系统 + 双GPU DataParallel
+# =============================================================
+# 核心改动 (对比 V17):
+#   1. K: 32 (was 8) — 每个观测33个粒子 (32 gen + 1 expert)
+#   2. 双GPU DataParallel — UNet forward 自动分到两张卡
+#   3. batch_size: 32 (was 64) — 保证 B*K=1024 在 2×16GB 内
+#   4. drift_scale: 50.0 (unchanged)
+#   5. epochs: 300 — 更多粒子估计drift更准，不需要那么多epoch
+
+data:
+  zarr_base: /home/gl/RoboTwin/policy/DP2DP3/data
+  task_config: demo_clean
+  camera_name: head_camera
+  tasks:
+    - beat_block_hammer
+  horizon: 8
+  n_obs_steps: 3
+  n_action_steps: 6
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: true
+
+encoder:
+  semantic_in_dim: 768
+  geometric_in_dim: 2048
+  proj_dim: 256
+  film_hidden: 256
+  out_dim: 1280
+  with_pos_enc: true
+  dropout: 0.1
+  max_tokens: 196
+
+drifting:
+  temp_scale: 1.0
+  K: 32
+  drift_scale: 50.0
+  drift_scale_min: 1.0               # 退火触底值变为 1.0 “constant”下保持50.0不变
+  drift_scale_schedule: "linear"     # 线性衰减  “cosine” “constant”
+
+train:
+  epochs: 600
+  batch_size: 32
+  lr: 0.0003
+  weight_decay: 0.000001
+  num_workers: 4
+
+precompute_batch_size: 32
+offload_backbone_after_precompute: true
+
+device:
+  gpu_ids: [0]
+
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_film_drifting/beat_block_hammer-demo_clean-v18-linear-50-0
+  save_every: 100
+  expert_data_num: 50

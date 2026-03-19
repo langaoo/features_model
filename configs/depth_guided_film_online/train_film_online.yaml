@@ -57,3 +57,10 @@ checkpoint:
   save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_film_online/place_a2b_left-demo_clean-50-0
   save_every: 100
   expert_data_num: 50
+
+wandb:
+  enable: false
+  project: geo_drift_policy
+  entity: ""
+  run_name: da3_film_dp_place_a2b_left
+  mode: offline

@@ -197,11 +197,10 @@ class TwoModelExtractors:
     @torch.no_grad()
     def _extract_da3_tokens(self, images: List[Image.Image]) -> torch.Tensor:
         """提取 DA3 backbone tokens (不做均值池化)."""
-        import tempfile
 
-        def _da3_forward_from_paths(paths: list[str]) -> torch.Tensor:
+        def _da3_forward(inputs: list[Image.Image | np.ndarray]) -> torch.Tensor:
             imgs_cpu, _, _ = self.da3_model._preprocess_inputs(
-                paths,
+                inputs,
                 extrinsics=None,
                 intrinsics=None,
                 process_res=self.da3_process_res,
@@ -233,29 +232,19 @@ class TwoModelExtractors:
             return tokens
 
         B = len(images)
-        temp_paths = []
-        try:
+        tokens = _da3_forward(images)
+        
+        if tokens.ndim == 2:
+            tokens = tokens.unsqueeze(0)
+        if tokens.shape[0] != B:
+            # 回退逐张
+            per_tokens = []
             for img in images:
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-                    temp_paths.append(f.name)
-                    img.save(f.name)
-
-            tokens = _da3_forward_from_paths(temp_paths)
-            if tokens.ndim == 2:
-                tokens = tokens.unsqueeze(0)
-            if tokens.shape[0] != B:
-                # 回退逐张
-                per_tokens = []
-                for p in temp_paths:
-                    t = _da3_forward_from_paths([p])
-                    if t.ndim == 2:
-                        t = t.unsqueeze(0)
-                    per_tokens.append(t[0])
-                tokens = torch.stack(per_tokens, dim=0)
-        finally:
-            for p in temp_paths:
-                if os.path.exists(p):
-                    os.unlink(p)
+                t = _da3_forward([img])
+                if t.ndim == 2:
+                    t = t.unsqueeze(0)
+                per_tokens.append(t[0])
+            tokens = torch.stack(per_tokens, dim=0)
 
         return tokens.float()
 

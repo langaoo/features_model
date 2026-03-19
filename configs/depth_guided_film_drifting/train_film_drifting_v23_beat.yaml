@@ -1,0 +1,82 @@
+# DA3-FiLM + Drifting Head V23 — beat_block_hammer
+# =============================================================
+# V23 设计目标: 在 V18 的基础上精准修复 late-epoch 退化
+#
+# 核心改动 (对比 V18):
+#   1. batch_size: 128 (was 32)     — 对齐 DP baseline, 梯度方差更低
+#   2. lr: 1e-4 (was 3e-4)          — 对齐 DP baseline, 防止后期震荡
+#   3. ema_decay: 0.999 (was 0)     — 平滑 late-epoch 权重, 有效窗口~1000步
+#   4. lr_scheduler: cosine + warmup — 显式声明 (V18 默认就是 cosine)
+#   5. save_every: 50 (was 100)     — 密集保存, 精确捕捉最优点
+#
+# 不改动的关键参数 (继承 V18 验证过的):
+#   - drift_scale: 50.0 constant   — 经过验证的最优 scale
+#   - temp_scale: 1.0              — median normalize 后的黄金比例
+#   - K: 32                        — 粒子数不变
+#   - P=1 (单 positive)            — 不用 multi-positive
+#
+# 训练步数估算:
+#   ~5000 frames / 128 batch = ~39 steps/epoch
+#   600 epochs * 39 = ~23400 total steps
+#   EMA=0.999 有效窗口 ~1000 步 (覆盖最近 ~25 epoch)
+#   LR warmup 500 步 ~= 前 12 epoch
+# =============================================================
+
+data:
+  zarr_base: /home/gl/RoboTwin/policy/DP2DP3/data
+  task_config: demo_clean
+  camera_name: head_camera
+  tasks:
+    - beat_block_hammer
+  horizon: 8
+  n_obs_steps: 3
+  n_action_steps: 6
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: true
+
+encoder:
+  semantic_in_dim: 768
+  geometric_in_dim: 2048
+  proj_dim: 256
+  film_hidden: 256
+  out_dim: 1280
+  with_pos_enc: true
+  dropout: 0.1
+  max_tokens: 196
+
+drifting:
+  temp_scale: 1.0
+  K: 32
+  drift_scale: 50.0
+  drift_scale_schedule: "constant"
+
+train:
+  epochs: 600
+  batch_size: 128
+  grad_accum_steps: 1
+  lr: 0.0001
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  weight_decay: 0.000001
+  num_workers: 4
+  ema_decay: 0.999
+
+precompute_batch_size: 32
+offload_backbone_after_precompute: true
+
+device:
+  gpu_ids: [1]
+
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_film_drifting/beat_block_hammer-demo_clean-v23-50-0
+  save_every: 100
+  expert_data_num: 50
+
+wandb:
+  enable: true
+  project: geo_drift_policy
+  entity: ""
+  run_name: drifting_v23_beat_block_hammer
+  mode: offline

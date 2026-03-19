@@ -1,0 +1,67 @@
+# DA3-FiLM + Drifting Head V31 — lift_pot
+# =============================================================
+# V31 设计目标: V22 + Fixed BC Anchor
+# =============================================================
+
+data:
+  zarr_base: /home/gl/RoboTwin/policy/DP2DP3/data
+  task_config: demo_clean
+  camera_name: head_camera
+  tasks:
+    - lift_pot
+  horizon: 8
+  n_obs_steps: 3
+  n_action_steps: 6
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: true
+
+encoder:
+  semantic_in_dim: 768
+  geometric_in_dim: 2048
+  proj_dim: 256
+  film_hidden: 256
+  out_dim: 1280
+  with_pos_enc: true
+  dropout: 0.1
+  max_tokens: 196
+
+drifting:
+  temp_scale: 1.0
+  K: 32
+  drift_alpha: 1.5
+  drift_scale_schedule: "constant"
+  positive_pool_size: 4
+  positive_radius: 2
+  bc_lambda: 0.1
+  bc_mode: "fixed"
+
+train:
+  epochs: 600
+  batch_size: 128
+  grad_accum_steps: 1
+  lr: 0.0001
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  weight_decay: 0.000001
+  num_workers: 4
+  ema_decay: 0.9995
+
+precompute_batch_size: 32
+offload_backbone_after_precompute: true
+
+device:
+  gpu_ids: [1]
+
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_film_drifting/lift_pot-demo_clean-v31-v22plusbc-50-0
+  save_every: 50
+  expert_data_num: 50
+
+wandb:
+  enable: true
+  project: geo_drift_policy
+  entity: ""
+  run_name: drifting_v31_lift_v22plusbc
+  mode: offline

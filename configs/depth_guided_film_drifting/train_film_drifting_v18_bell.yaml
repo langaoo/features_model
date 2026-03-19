@@ -1,0 +1,49 @@
+# DA3-FiLM + Drifting Head V18 — click_bell
+# K=32 大粒子系统 + 双GPU DataParallel
+
+data:
+  zarr_base: /home/gl/RoboTwin/policy/DP2DP3/data
+  task_config: demo_clean
+  camera_name: head_camera
+  tasks:
+    - click_bell
+  horizon: 8
+  n_obs_steps: 3
+  n_action_steps: 6
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: true
+
+encoder:
+  semantic_in_dim: 768
+  geometric_in_dim: 2048
+  proj_dim: 256
+  film_hidden: 256
+  out_dim: 1280
+  with_pos_enc: true
+  dropout: 0.1
+  max_tokens: 196
+
+drifting:
+  temp_scale: 1.0
+  K: 32
+  drift_scale: 50.0
+
+train:
+  epochs: 600
+  batch_size: 32
+  lr: 0.0003
+  weight_decay: 0.000001
+  num_workers: 4
+
+precompute_batch_size: 32
+offload_backbone_after_precompute: true
+
+device:
+  gpu_ids: [0, 1]
+
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_film_drifting/click_bell-demo_clean-50-0-v18
+  save_every: 50
+  expert_data_num: 50

@@ -1,0 +1,68 @@
+# DA3-FiLM + Drifting Head V22 — beat_block_hammer
+# =============================================================
+# V22 设计目标:
+#   1. 保留 V18 的 constant high local drift 主线
+#   2. 引入 temporal multi-positive drift，更贴近原论文多正样本设定
+#   3. 训练制度对齐 DP: effective batch=128, lr=1e-4, cosine+warmup, EMA
+# =============================================================
+
+data:
+  zarr_base: /home/gl/RoboTwin/policy/DP2DP3/data
+  task_config: demo_clean
+  camera_name: head_camera
+  tasks:
+    - beat_block_hammer
+  horizon: 8
+  n_obs_steps: 3
+  n_action_steps: 6
+  use_left_arm: true
+  use_right_arm: true
+  fuse_arms: true
+  include_gripper: true
+
+encoder:
+  semantic_in_dim: 768
+  geometric_in_dim: 2048
+  proj_dim: 256
+  film_hidden: 256
+  out_dim: 1280
+  with_pos_enc: true
+  dropout: 0.1
+  max_tokens: 196
+
+drifting:
+  temp_scale: 1.0
+  K: 32
+  drift_alpha: 1.5               # effective drift_scale = K * alpha = 48.0
+  drift_scale_schedule: "constant"
+  positive_pool_size: 4
+  positive_radius: 2
+
+train:
+  epochs: 600
+  batch_size: 128
+  grad_accum_steps: 1            # effective batch = 128
+  lr: 0.0001
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  weight_decay: 0.000001
+  num_workers: 4
+  ema_decay: 0.9995
+
+precompute_batch_size: 32
+offload_backbone_after_precompute: true
+
+device:
+  gpu_ids: [0]
+
+checkpoint:
+  save_dir: /home/gl/RoboTwin/policy/DP2DP3/checkpoints_film_drifting/beat_block_hammer-demo_clean-v22-multipos-alpha1p5-50-0
+  save_every: 50
+  expert_data_num: 50
+
+wandb:
+  enable: true
+  project: geo_drift_policy
+  entity: ""
+  run_name: drifting_v22_beat_block_hammer
+  mode: offline
